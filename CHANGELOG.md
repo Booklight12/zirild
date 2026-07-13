@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1 - 2026-07-14
+
+- Declares the BSD 2-Clause license with copyright held by SorMaze.
+- Adds crates.io publication metadata for the project repository.
+
 ## 0.1.0 - 2026-07-14
 
 Initial release.

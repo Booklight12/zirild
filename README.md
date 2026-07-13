@@ -71,4 +71,10 @@ Android-NDK-linked artifact.
 
 ## License
 
-BSD-2-Clause. Copyright (c) 2026 SorMaze.
+This project is licensed under the BSD 2-Clause License.
+
+Copyright (c) 2026 SorMaze. All rights reserved.
+
+Redistribution in source or binary form is permitted provided that the
+copyright notice, conditions, and disclaimer in [LICENSE](LICENSE) are
+retained.
