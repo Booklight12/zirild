@@ -2,6 +2,16 @@
 name = "cargo-zirild"
 version = "0.1.0"
 edition = "2024"
+authors = ["SorMaze"]
+rust-version = "1.85"
+description = "Cargo subcommand that builds Rust projects with Zig C/C++ and linker toolchains"
+readme = "README.md"
+license = "BSD-2-Clause"
+documentation = "https://docs.rs/cargo-zirild"
+homepage = "https://github.com/Booklight12/zirild"
+repository = "https://github.com/Booklight12/zirild"
+keywords = ["cargo", "zig", "cross-compilation", "cxx"]
+categories = ["command-line-utilities", "development-tools::build-utils"]
 
 [dependencies]
 

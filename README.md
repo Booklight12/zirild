@@ -1,5 +1,7 @@
 # cargo-zirild
 
+[Repository](https://github.com/Booklight12/zirild)
+
 cargo-zirild builds the current Rust Cargo project, its Rust dependencies,
 and native C/C++ dependencies through Zig. It creates temporary tool wrappers
 automatically; no .cargo/config.toml, CC, CXX, linker, or AR configuration is
@@ -66,3 +68,7 @@ When an Android target is requested, cargo-zirild reports that the bundled Zig
 toolchain has no Android libc and suggests the corresponding musl target. A
 musl binary may be suitable for Android-like environments, but it is not an
 Android-NDK-linked artifact.
+
+## License
+
+BSD-2-Clause. Copyright (c) 2026 SorMaze.
