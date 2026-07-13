@@ -1,0 +1,10 @@
+[package]
+name = "cargo-zirild"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[[bin]]
+name = "cargo-zirild"
+path = "src/main.rs"
