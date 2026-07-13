@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.3 - 2026-07-14
+
+- Fix Cargo's injected zirild subcommand argument from being forwarded to the
+  internal cargo build command.
+- Support x86_64-pc-windows as shorthand for the MSVC Rust target, using the
+  system MSVC compiler, linker, and librarian.
+- Provide zig dlltool for Windows GNU raw-dylib import libraries and normalize
+  its LLVM-compatible arguments.
+- Translate Windows GNU response files for Zig, including module-definition
+  files, third-party import archives, CRT libraries, and empty DLL exports.
+- Verify x86_64-unknown-linux-gnu builds through Zig and document the sysroot
+  requirement for Linux desktop libraries outside libc.
+
 ## 0.1.1 - 2026-07-14
 
 - Declares the BSD 2-Clause license with copyright held by SorMaze.

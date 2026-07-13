@@ -2,14 +2,16 @@
 
 [Repository](https://github.com/Booklight12/zirild)
 
-cargo-zirild builds the current Rust Cargo project, its Rust dependencies,
-and native C/C++ dependencies through Zig. It creates temporary tool wrappers
-automatically; no .cargo/config.toml, CC, CXX, linker, or AR configuration is
-required from the caller.
+cargo-zirild builds the current Rust Cargo project and its dependencies for
+Zig-supported targets. It creates temporary tool wrappers automatically; no
+.cargo/config.toml, CC, CXX, linker, AR, or dlltool configuration is required
+from the caller.
 
-Rust source remains compiled by rustc. The tool configures Cargo so Rust
-linking uses zig cc, while cc-crate build scripts use zig cc, zig c++, and zig
-ar for C, C++, and archives respectively.
+Rust source remains compiled by rustc. For GNU-family targets, Rust linking
+uses zig cc, while cc-crate build scripts use zig cc, zig c++, and zig ar for
+C, C++, and archives respectively. Windows GNU raw-dylib import libraries use
+zig dlltool. MSVC targets retain the system MSVC compiler, linker, and
+librarian because MSVC build scripts require that ABI-compatible tool family.
 
 ## Prerequisites
 
@@ -33,6 +35,10 @@ Android-NDK-linked artifact.
 
     # Zig target x86_64-windows-gnu maps to Cargo x86_64-pc-windows-gnu.
     cargo zirild -target=x86_64-windows-gnu
+
+    # Short Windows target selects x86_64-pc-windows-msvc.
+    cargo zirild -target=x86_64-pc-windows
+
     cargo zirild -target=x86_64-unknown-linux-gnu -zigpatch=D:\tools\zig\zig.exe
 
     # Cargo release profile and Zig ReleaseFast native/link optimization.
@@ -47,6 +53,20 @@ Android-NDK-linked artifact.
 The resulting artifact uses Cargo's normal path:
 target/<cargo-target>/debug/ by default or target/<cargo-target>/release/ with
 --release.
+
+## Linux GNU
+
+Both Zig and Rust target spellings are accepted:
+
+    rustup target add x86_64-unknown-linux-gnu
+    cargo zirild -target=x86_64-linux-gnu
+    cargo zirild -target=x86_64-unknown-linux-gnu
+
+Zig supplies the GNU libc toolchain for ordinary Rust and native C/C++
+dependencies. Applications that link Linux desktop libraries outside libc,
+such as DBus, GTK, X11, or WebKit2GTK, additionally require a target Linux
+sysroot containing those libraries and their pkg-config metadata. Zig does not
+bundle application-level Linux desktop libraries.
 
 ## Zig optimization mapping
 
@@ -73,7 +93,7 @@ Android-NDK-linked artifact.
 
 This project is licensed under the BSD 2-Clause License.
 
-Copyright (c) 2026 SorMaze. All rights reserved.
+Copyright (c) 2026 SorMaze.
 
 Redistribution in source or binary form is permitted provided that the
 copyright notice, conditions, and disclaimer in [LICENSE](LICENSE) are
