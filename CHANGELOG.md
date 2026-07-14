@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.5 - 2026-07-14
+
+- Add Android NDK discovery from `Ndk_home`, selecting the newest installed
+  version by default, an exact `-ndkversion=<version>` selector, and the
+  newest-first `-nindx=<index>` selector.
+- Parse Android API, ABI, STL, native compiler/linker flags, and common
+  CMake-style `-DANDROID_*` configuration values without forwarding them to
+  Cargo as invalid arguments.
+- Add explicit `-ndkfallback` support for Android NDK Clang/LLD and LLVM ar.
+  This emits a prominent warning because the final file is no longer linked by
+  Zig.
+- Validate the five locally installed Rust targets against the `t1` project,
+  including NDK-linked Android ELF outputs.
+- Filter the Windows GNU auto-image-base switches that Zig LLD ignores, removing
+  its non-actionable linker warning.
+
 ## 0.1.4 - 2026-07-14
 
 - Add Cargo command selection for build, check, run, test, bench, rustc,

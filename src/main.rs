@@ -31,7 +31,7 @@ Other options:
   -android-stl=<name>         Android: export the requested NDK STL setting
   -android-cflag=<flag>       Android: pass one flag to the selected native compiler
   -android-link-arg=<flag>    Android: pass one flag to the selected native linker
-  -ndkfaback                  Android: explicitly use NDK Clang/LLD instead of Zig
+  -ndkfallback                Android: explicitly use NDK Clang/LLD instead of Zig
   -h, --help                  Show this help
 
 Cargo command:
@@ -50,7 +50,7 @@ Android NDK location:
   containing version subdirectories. Zirild always keeps Zig as the final
   compiler/linker; it never silently replaces it with NDK clang. CMake-style
   -DANDROID_ABI=..., -DANDROID_PLATFORM=android-<api>, and -DANDROID_STL=...
-  are also parsed in Android mode. -ndkfaback is the explicit LLVM fallback.
+  are also parsed in Android mode. -ndkfallback is the explicit LLVM fallback.
 "#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -222,7 +222,7 @@ fn parse_args(args: Vec<OsString>) -> Result<BuildOptions, String> {
                 return Err("-android-link-arg cannot be empty".into());
             }
             android.link_args.push(value.into());
-        } else if argument == "-ndkfaback" {
+        } else if argument == "-ndkfallback" {
             android.ndk_fallback = true;
         } else if let Some(value) = text.strip_prefix("-DANDROID_ABI=") {
             if value.is_empty() {
@@ -768,7 +768,7 @@ fn run_cargo(
     } else if options.android.ndk_fallback {
         let ndk = android_ndk.expect("fallback is validated as Android-only");
         eprintln!(
-            "cargo-zirild: WARNING: -ndkfaback enabled. This build uses Android NDK Clang/LLD directly; the final output is not linked by Zig."
+            "cargo-zirild: WARNING: -ndkfallback enabled. This build uses Android NDK Clang/LLD directly; the final output is not linked by Zig."
         );
         eprintln!(
             "+ cargo {} --target {} (Android NDK Clang/LLD fallback {} at {} / {})",
@@ -923,7 +923,9 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
         }
         if mode == WrapperMode::Linker
             && (argument == "-nodefaultlibs"
-                || (windows_link && is_windows_runtime_argument(argument)))
+                || (windows_link
+                    && (is_windows_runtime_argument(argument)
+                        || is_windows_auto_image_base_argument(argument))))
         {
             argument_index += 1;
             continue;
@@ -1002,6 +1004,19 @@ fn is_windows_runtime_argument(argument: &OsString) -> bool {
             | "-lmingwex"
             | "-lmingw32"
             | "-lgcc"
+    )
+}
+
+/// Zig's bundled LLD explicitly ignores MinGW's auto-image-base switches and
+/// emits a warning for them. Removing them keeps the Windows GNU build clean
+/// without changing Zig's image-base behavior.
+fn is_windows_auto_image_base_argument(argument: &OsString) -> bool {
+    matches!(
+        argument.to_string_lossy().as_ref(),
+        "-Wl,--enable-auto-image-base"
+            | "-Wl,--disable-auto-image-base"
+            | "--enable-auto-image-base"
+            | "--disable-auto-image-base"
     )
 }
 
@@ -1128,7 +1143,8 @@ fn transform_windows_response_line(line: &str, library_directories: &[PathBuf]) 
     let trimmed = line.trim();
     let quoted = trimmed.starts_with('"') && trimmed.ends_with('"');
     let value = trimmed.trim_matches('"');
-    if is_windows_runtime_argument(&OsString::from(value)) {
+    let argument = OsString::from(value);
+    if is_windows_runtime_argument(&argument) || is_windows_auto_image_base_argument(&argument) {
         return None;
     }
 
@@ -1217,7 +1233,7 @@ fn warn_about_android_target(zig_target: &str, ndk: Option<&AndroidNdk>, ndk_fal
     if let Some(ndk) = ndk {
         if ndk_fallback {
             eprintln!(
-                "cargo-zirild: Android NDK {} selected at '{}'; -ndkfaback will use its Clang/LLD tools directly.",
+                "cargo-zirild: Android NDK {} selected at '{}'; -ndkfallback will use its Clang/LLD tools directly.",
                 ndk.version,
                 ndk.root.display()
             );
@@ -1414,6 +1430,10 @@ mod tests {
             transform_windows_response_line("\"-nodefaultlibs\"", &[]),
             None
         );
+        assert_eq!(
+            transform_windows_response_line("\"-Wl,--disable-auto-image-base\"", &[]),
+            None
+        );
     }
 
     #[test]
@@ -1475,7 +1495,7 @@ mod tests {
             "-DANDROID_STL=c++_shared".into(),
             "-android-cflag=-fPIC".into(),
             "-android-link-arg=-Wl,--build-id".into(),
-            "-ndkfaback".into(),
+            "-ndkfallback".into(),
         ])
         .unwrap();
         assert_eq!(options.zig_target, "x86_64-linux-android.24");

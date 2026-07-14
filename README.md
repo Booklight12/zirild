@@ -49,7 +49,7 @@ compatibility alternative; that alternative produces a self-contained musl
 Linux binary, not an Android-NDK-linked application.
 
 If producing an Android file is more important than retaining the Zig-linker
-contract, pass `-ndkfaback` (spelling retained for CLI compatibility). This is
+contract, pass `-ndkfallback`. This is
 an explicit opt-in to the selected NDK's Clang/LLD and LLVM ar. Zirild prints a
 warning before the Cargo command because the final file is then **not** linked
 by Zig.
@@ -106,7 +106,7 @@ cargo zirild -target=x86_64-linux-android -android-cflag=-fPIC -android-link-arg
 
 # Explicitly fall back to the selected NDK Clang/LLD to produce an Android file.
 # The final linker is not Zig; Zirild prints a warning.
-cargo zirild -target=x86_64-linux-android -ndkfaback build
+cargo zirild -target=x86_64-linux-android -ndkfallback build
 ```
 
 Supported Android-specific options are `-ndkversion`, `-nindx`,
@@ -115,8 +115,29 @@ Supported Android-specific options are `-ndkversion`, `-nindx`,
 `-DANDROID_PLATFORM=android-<api>`, and `-DANDROID_STL=...`; they become
 `ANDROID_ABI`, `ANDROID_PLATFORM`, and `ANDROID_STL` environment values for
 Cargo build scripts. It also exports the selected NDK as `ANDROID_NDK_ROOT` and
-`CMAKE_ANDROID_NDK`. `-ndkfaback` is Android-only and intentionally switches
+`CMAKE_ANDROID_NDK`. `-ndkfallback` is Android-only and intentionally switches
 the C compiler, C++ compiler, linker, and archiver to NDK Clang/LLD and LLVM ar.
+
+## Current target validation
+
+The following matrix was compiled on Windows against the locally installed Rust
+targets on 2026-07-14. The validation project was
+`D:\User\Document\RustProject\t1`, a standalone Rust binary with no native
+dependencies. This validates compilation and linker output, not execution on a
+device or foreign operating system.
+
+| Rust target | Zirild invocation | Native linker | Result |
+| --- | --- | --- | --- |
+| `aarch64-linux-android` | `-ndkfallback build` | NDK 30.0.14904198 Clang/LLD | passed; ELF64 AArch64 PIE |
+| `x86_64-linux-android` | `-ndkfallback build` | NDK 30.0.14904198 Clang/LLD | passed; ELF64 x86-64 PIE |
+| `x86_64-pc-windows-gnu` | `build` | Zig LLD | passed |
+| `x86_64-pc-windows-msvc` | `build` | system MSVC | passed |
+| `x86_64-unknown-linux-gnu` | `build` | Zig LLD | passed |
+
+The Android artifacts were inspected with the selected NDK's `llvm-readelf`.
+For Windows GNU, Zirild filters Rust's `--enable/--disable-auto-image-base`
+switches because Zig LLD reports them as unimplemented and ignores them; this
+removes the warning without changing Zig's image-base behavior.
 
 `build` is the default Cargo command. You can also select `check`, `run`,
 `test`, `bench`, `rustc`, `clippy`, or `doc`. The command may follow the Zirild
@@ -177,7 +198,7 @@ reports the selected NDK during the actual Cargo invocation, exports its root
 and sysroot for build scripts, forwards Android-only native flags to Zig, and
 retains Zig as the final linker. It also explains the current Android libc
 linkage constraint. The musl suggestion is an explicit compatibility
-alternative, not an Android target. With explicit `-ndkfaback`, Zirild instead
+alternative, not an Android target. With explicit `-ndkfallback`, Zirild instead
 uses NDK Clang/LLD and clearly warns that the final linker is no longer Zig.
 
 ## License
