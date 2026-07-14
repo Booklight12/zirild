@@ -24,6 +24,14 @@ Zig optimisation:
 
 Other options:
   -zigpatch=<path>            Use this Zig executable/directory before Zig_home
+  -ndkversion=<version>       Android: select an exact NDK version below Ndk_home
+  -nindx=<index>              Android: select NDK by newest-first index (0 = newest)
+  -android-api=<level>        Android: use an Android API level for Zig's target
+  -android-abi=<abi>          Android: validate ABI (arm64-v8a, x86_64, etc.)
+  -android-stl=<name>         Android: export the requested NDK STL setting
+  -android-cflag=<flag>       Android: pass one flag to the selected native compiler
+  -android-link-arg=<flag>    Android: pass one flag to the selected native linker
+  -ndkfaback                  Android: explicitly use NDK Clang/LLD instead of Zig
   -h, --help                  Show this help
 
 Cargo command:
@@ -36,6 +44,13 @@ Cargo's corresponding Rust triple.
 
 Zig location:
   Set Zig_home to the Zig installation directory or the full path to zig/zig.exe.
+
+Android NDK location:
+  Set Ndk_home to either an NDK installation or Android SDK's ndk directory
+  containing version subdirectories. Zirild always keeps Zig as the final
+  compiler/linker; it never silently replaces it with NDK clang. CMake-style
+  -DANDROID_ABI=..., -DANDROID_PLATFORM=android-<api>, and -DANDROID_STL=...
+  are also parsed in Android mode. -ndkfaback is the explicit LLVM fallback.
 "#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +70,29 @@ struct BuildOptions {
     zig_patch: Option<PathBuf>,
     cargo_command: String,
     cargo_args: Vec<OsString>,
+    android: AndroidOptions,
+}
+
+#[derive(Debug, Default)]
+struct AndroidOptions {
+    ndk_version: Option<String>,
+    ndk_index: Option<usize>,
+    api_level: Option<u32>,
+    abi: Option<String>,
+    stl: Option<String>,
+    cflags: Vec<String>,
+    link_args: Vec<String>,
+    ndk_fallback: bool,
+}
+
+#[derive(Debug)]
+struct AndroidNdk {
+    root: PathBuf,
+    version: String,
+    sysroot: PathBuf,
+    cc: PathBuf,
+    cxx: PathBuf,
+    ar: PathBuf,
 }
 
 fn main() -> ExitCode {
@@ -91,10 +129,26 @@ fn run_driver(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     }
 
     let options = parse_args(args)?;
-    let zig = zig_executable(options.zig_patch.as_deref())?;
-    warn_about_android_target(&options.zig_target);
+    let android_ndk = if is_android_target(&options.cargo_target) {
+        Some(android_ndk(&options.android, &options.cargo_target)?)
+    } else {
+        if options.android.is_configured() {
+            return Err("Android-only options require an Android -target".into());
+        }
+        None
+    };
+    let zig = if options.android.ndk_fallback {
+        None
+    } else {
+        Some(zig_executable(options.zig_patch.as_deref())?)
+    };
+    warn_about_android_target(
+        &options.zig_target,
+        android_ndk.as_ref(),
+        options.android.ndk_fallback,
+    );
     let wrappers = make_wrappers()?;
-    let result = run_cargo(&options, &zig, &wrappers);
+    let result = run_cargo(&options, zig.as_deref(), &wrappers, android_ndk.as_ref());
     let _ = fs::remove_dir_all(&wrappers.directory);
     result
 }
@@ -107,6 +161,7 @@ fn parse_args(args: Vec<OsString>) -> Result<BuildOptions, String> {
     let mut small = false;
     let mut cargo_command = None;
     let mut cargo_args = Vec::new();
+    let mut android = AndroidOptions::default();
     let mut passthrough = false;
     let mut cargo_value_expected = false;
 
@@ -136,6 +191,51 @@ fn parse_args(args: Vec<OsString>) -> Result<BuildOptions, String> {
                 return Err("-zigpatch cannot be empty".into());
             }
             zig_patch = Some(PathBuf::from(value));
+        } else if let Some(value) = text.strip_prefix("-ndkversion=") {
+            if value.is_empty() {
+                return Err("-ndkversion cannot be empty".into());
+            }
+            android.ndk_version = Some(value.into());
+        } else if let Some(value) = text.strip_prefix("-nindx=") {
+            android.ndk_index = Some(value.parse().map_err(|_| {
+                format!("invalid -nindx '{value}'; use a non-negative integer (0 = newest)")
+            })?);
+        } else if let Some(value) = text.strip_prefix("-android-api=") {
+            set_android_api_level(&mut android, value)?;
+        } else if let Some(value) = text.strip_prefix("-android-abi=") {
+            if value.is_empty() {
+                return Err("-android-abi cannot be empty".into());
+            }
+            android.abi = Some(value.into());
+        } else if let Some(value) = text.strip_prefix("-android-stl=") {
+            if value.is_empty() {
+                return Err("-android-stl cannot be empty".into());
+            }
+            android.stl = Some(value.into());
+        } else if let Some(value) = text.strip_prefix("-android-cflag=") {
+            if value.is_empty() {
+                return Err("-android-cflag cannot be empty".into());
+            }
+            android.cflags.push(value.into());
+        } else if let Some(value) = text.strip_prefix("-android-link-arg=") {
+            if value.is_empty() {
+                return Err("-android-link-arg cannot be empty".into());
+            }
+            android.link_args.push(value.into());
+        } else if argument == "-ndkfaback" {
+            android.ndk_fallback = true;
+        } else if let Some(value) = text.strip_prefix("-DANDROID_ABI=") {
+            if value.is_empty() {
+                return Err("-DANDROID_ABI cannot be empty".into());
+            }
+            android.abi = Some(value.into());
+        } else if let Some(value) = text.strip_prefix("-DANDROID_PLATFORM=") {
+            set_android_api_level(&mut android, value)?;
+        } else if let Some(value) = text.strip_prefix("-DANDROID_STL=") {
+            if value.is_empty() {
+                return Err("-DANDROID_STL cannot be empty".into());
+            }
+            android.stl = Some(value.into());
         } else if argument == "--release" {
             release = true;
             cargo_args.push(argument);
@@ -170,7 +270,14 @@ fn parse_args(args: Vec<OsString>) -> Result<BuildOptions, String> {
         }
     });
     let cargo_target = cargo_target_for(&target);
-    let zig_target = zig_target_for(&target);
+    let mut zig_target = zig_target_for(&target);
+    if is_android_target(&cargo_target) {
+        validate_android_options(&android, &cargo_target)?;
+        if let Some(api_level) = android.api_level {
+            zig_target.push('.');
+            zig_target.push_str(&api_level.to_string());
+        }
+    }
 
     Ok(BuildOptions {
         zig_target,
@@ -179,7 +286,55 @@ fn parse_args(args: Vec<OsString>) -> Result<BuildOptions, String> {
         zig_patch,
         cargo_command: cargo_command.unwrap_or_else(|| "build".into()),
         cargo_args,
+        android,
     })
+}
+
+impl AndroidOptions {
+    fn is_configured(&self) -> bool {
+        self.ndk_version.is_some()
+            || self.ndk_index.is_some()
+            || self.api_level.is_some()
+            || self.abi.is_some()
+            || self.stl.is_some()
+            || !self.cflags.is_empty()
+            || !self.link_args.is_empty()
+            || self.ndk_fallback
+    }
+}
+
+fn set_android_api_level(android: &mut AndroidOptions, value: &str) -> Result<(), String> {
+    let value = value.strip_prefix("android-").unwrap_or(value);
+    let api_level = value
+        .parse::<u32>()
+        .map_err(|_| format!("invalid Android API level '{value}'"))?;
+    if api_level == 0 {
+        return Err("Android API level must be greater than zero".into());
+    }
+    if let Some(previous) = android.api_level
+        && previous != api_level
+    {
+        return Err(format!(
+            "conflicting Android API levels: android-{previous} and android-{api_level}"
+        ));
+    }
+    android.api_level = Some(api_level);
+    Ok(())
+}
+
+fn validate_android_options(android: &AndroidOptions, cargo_target: &str) -> Result<(), String> {
+    if android.ndk_version.is_some() && android.ndk_index.is_some() {
+        return Err("use either -ndkversion or -nindx, not both".into());
+    }
+    if let Some(abi) = &android.abi
+        && let Some(expected) = android_abi_for_target(cargo_target)
+        && abi != expected
+    {
+        return Err(format!(
+            "Android ABI '{abi}' does not match target {cargo_target}; use {expected}"
+        ));
+    }
+    Ok(())
 }
 
 fn cargo_command_name(argument: &str) -> Option<&'static str> {
@@ -286,6 +441,195 @@ fn verify_zig(executable: &Path, source: &str) -> Result<PathBuf, String> {
     }
 }
 
+fn is_android_target(target: &str) -> bool {
+    matches!(
+        target,
+        "aarch64-linux-android"
+            | "armv7-linux-androideabi"
+            | "i686-linux-android"
+            | "x86_64-linux-android"
+    )
+}
+
+fn android_abi_for_target(target: &str) -> Option<&'static str> {
+    match target {
+        "aarch64-linux-android" => Some("arm64-v8a"),
+        "armv7-linux-androideabi" => Some("armeabi-v7a"),
+        "i686-linux-android" => Some("x86"),
+        "x86_64-linux-android" => Some("x86_64"),
+        _ => None,
+    }
+}
+
+fn android_ndk(options: &AndroidOptions, cargo_target: &str) -> Result<AndroidNdk, String> {
+    let home = env::var_os("Ndk_home").ok_or_else(|| {
+        "Ndk_home is not set; set it to an Android NDK installation or Android SDK ndk directory"
+            .to_owned()
+    })?;
+    let root = select_ndk_root(Path::new(&home), options)?;
+    let version = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("direct")
+        .to_owned();
+    let sysroot = root
+        .join("toolchains")
+        .join("llvm")
+        .join("prebuilt")
+        .join(ndk_host_tag())
+        .join("sysroot");
+    if !sysroot.is_dir() {
+        return Err(format!(
+            "Android NDK '{}' has no sysroot for host '{}': {}",
+            root.display(),
+            ndk_host_tag(),
+            sysroot.display()
+        ));
+    }
+    let bin = root
+        .join("toolchains")
+        .join("llvm")
+        .join("prebuilt")
+        .join(ndk_host_tag())
+        .join("bin");
+    let (compiler_prefix, default_api_level) = android_compiler_prefix(cargo_target)?;
+    let api_level = options.api_level.unwrap_or(default_api_level);
+    let executable_extension = if cfg!(windows) { ".cmd" } else { "" };
+    let cc = bin.join(format!(
+        "{compiler_prefix}{api_level}-clang{executable_extension}"
+    ));
+    let cxx = bin.join(format!(
+        "{compiler_prefix}{api_level}-clang++{executable_extension}"
+    ));
+    let ar = bin.join(if cfg!(windows) {
+        "llvm-ar.exe"
+    } else {
+        "llvm-ar"
+    });
+    if options.ndk_fallback {
+        for (name, tool) in [
+            ("C compiler", &cc),
+            ("C++ compiler", &cxx),
+            ("archiver", &ar),
+        ] {
+            if !tool.is_file() {
+                return Err(format!(
+                    "Android NDK '{}' does not provide the {name} needed for {cargo_target}: {}",
+                    root.display(),
+                    tool.display()
+                ));
+            }
+        }
+    }
+    Ok(AndroidNdk {
+        root,
+        version,
+        sysroot,
+        cc,
+        cxx,
+        ar,
+    })
+}
+
+fn android_compiler_prefix(target: &str) -> Result<(&'static str, u32), String> {
+    match target {
+        "aarch64-linux-android" => Ok(("aarch64-linux-android", 21)),
+        "armv7-linux-androideabi" => Ok(("armv7a-linux-androideabi", 16)),
+        "i686-linux-android" => Ok(("i686-linux-android", 16)),
+        "x86_64-linux-android" => Ok(("x86_64-linux-android", 21)),
+        _ => Err(format!("unsupported Android Rust target: {target}")),
+    }
+}
+
+fn select_ndk_root(home: &Path, options: &AndroidOptions) -> Result<PathBuf, String> {
+    let is_ndk_root = |path: &Path| {
+        path.join("toolchains")
+            .join("llvm")
+            .join("prebuilt")
+            .is_dir()
+    };
+    if is_ndk_root(home) {
+        if options.ndk_version.is_some() || options.ndk_index.is_some() {
+            return Err(format!(
+                "Ndk_home '{}' already points to one NDK installation; remove -ndkversion/-nindx",
+                home.display()
+            ));
+        }
+        return Ok(home.into());
+    }
+    if !home.is_dir() {
+        return Err(format!("Ndk_home path does not exist: {}", home.display()));
+    }
+
+    let candidates = fs::read_dir(home)
+        .map_err(|err| format!("cannot read Ndk_home directory '{}': {err}", home.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && is_ndk_root(path))
+        .collect::<Vec<_>>();
+    let available = candidates
+        .iter()
+        .filter_map(|path| path.file_name()?.to_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    select_ndk_candidate(candidates, options).ok_or_else(|| {
+        if let Some(version) = &options.ndk_version {
+            format!(
+                "NDK version '{version}' was not found below Ndk_home '{}'; available versions: {available}",
+                home.display()
+            )
+        } else if let Some(index) = options.ndk_index {
+            format!(
+                "NDK index {index} is out of range below Ndk_home '{}'; newest-first versions: {available}",
+                home.display()
+            )
+        } else {
+            format!(
+                "Ndk_home '{}' is not an NDK and contains no NDK version with toolchains/llvm/prebuilt",
+                home.display()
+            )
+        }
+    })
+}
+
+fn select_ndk_candidate(mut candidates: Vec<PathBuf>, options: &AndroidOptions) -> Option<PathBuf> {
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort_by_key(|path| std::cmp::Reverse(ndk_version_key(path)));
+    if let Some(version) = &options.ndk_version {
+        return candidates.into_iter().find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy() == version.as_str())
+        });
+    }
+    if let Some(index) = options.ndk_index {
+        return candidates.into_iter().nth(index);
+    }
+    candidates.into_iter().next()
+}
+
+fn ndk_version_key(path: &Path) -> Vec<u32> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .split('.')
+        .map(|piece| piece.parse().unwrap_or(0))
+        .collect()
+}
+
+fn ndk_host_tag() -> &'static str {
+    if cfg!(windows) {
+        "windows-x86_64"
+    } else if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+        "darwin-arm64"
+    } else if cfg!(target_os = "macos") {
+        "darwin-x86_64"
+    } else {
+        "linux-x86_64"
+    }
+}
+
 struct Wrappers {
     directory: PathBuf,
     cc: PathBuf,
@@ -341,7 +685,12 @@ fn make_wrappers() -> Result<Wrappers, String> {
     })
 }
 
-fn run_cargo(options: &BuildOptions, zig: &Path, wrappers: &Wrappers) -> Result<(), String> {
+fn run_cargo(
+    options: &BuildOptions,
+    zig: Option<&Path>,
+    wrappers: &Wrappers,
+    android_ndk: Option<&AndroidNdk>,
+) -> Result<(), String> {
     let mut command = Command::new("cargo");
     command
         .arg(&options.cargo_command)
@@ -349,9 +698,39 @@ fn run_cargo(options: &BuildOptions, zig: &Path, wrappers: &Wrappers) -> Result<
         .arg(&options.cargo_target)
         .args(&options.cargo_args);
 
-    command.env("CARGO_ZIRILD_ZIG", zig);
+    if let Some(zig) = zig {
+        command.env("CARGO_ZIRILD_ZIG", zig);
+    }
     command.env("CARGO_ZIRILD_ZIG_TARGET", &options.zig_target);
     command.env("CARGO_ZIRILD_OPTIMIZE", &options.optimize);
+    if let Some(ndk) = android_ndk {
+        command.env("CARGO_ZIRILD_ANDROID_SYSROOT", &ndk.sysroot);
+        command.env(
+            "CARGO_ZIRILD_ANDROID_CFLAGS",
+            encode_wrapper_arguments(&options.android.cflags),
+        );
+        command.env(
+            "CARGO_ZIRILD_ANDROID_LINK_ARGS",
+            encode_wrapper_arguments(&options.android.link_args),
+        );
+        command.env("ANDROID_NDK_ROOT", &ndk.root);
+        command.env("CMAKE_ANDROID_NDK", &ndk.root);
+        if options.android.ndk_fallback {
+            command.env("CARGO_ZIRILD_NDK_FALLBACK", "1");
+            command.env("CARGO_ZIRILD_NDK_CC", &ndk.cc);
+            command.env("CARGO_ZIRILD_NDK_CXX", &ndk.cxx);
+            command.env("CARGO_ZIRILD_NDK_AR", &ndk.ar);
+        }
+        if let Some(abi) = &options.android.abi {
+            command.env("ANDROID_ABI", abi);
+        }
+        if let Some(api_level) = options.android.api_level {
+            command.env("ANDROID_PLATFORM", format!("android-{api_level}"));
+        }
+        if let Some(stl) = &options.android.stl {
+            command.env("ANDROID_STL", stl);
+        }
+    }
 
     let normalized = options.cargo_target.replace('-', "_").to_ascii_uppercase();
     let is_msvc = options.cargo_target.ends_with("-msvc");
@@ -385,6 +764,29 @@ fn run_cargo(options: &BuildOptions, zig: &Path, wrappers: &Wrappers) -> Result<
         eprintln!(
             "+ cargo {} --target {} (MSVC toolchain / {})",
             options.cargo_command, options.cargo_target, options.optimize
+        );
+    } else if options.android.ndk_fallback {
+        let ndk = android_ndk.expect("fallback is validated as Android-only");
+        eprintln!(
+            "cargo-zirild: WARNING: -ndkfaback enabled. This build uses Android NDK Clang/LLD directly; the final output is not linked by Zig."
+        );
+        eprintln!(
+            "+ cargo {} --target {} (Android NDK Clang/LLD fallback {} at {} / {})",
+            options.cargo_command,
+            options.cargo_target,
+            ndk.version,
+            ndk.root.display(),
+            options.optimize
+        );
+    } else if let Some(ndk) = android_ndk {
+        eprintln!(
+            "+ cargo {} --target {} (Zig {} / Android NDK {} at {} / {})",
+            options.cargo_command,
+            options.cargo_target,
+            options.zig_target,
+            ndk.version,
+            ndk.root.display(),
+            options.optimize
         );
     } else {
         eprintln!(
@@ -424,43 +826,79 @@ fn wrapper_mode() -> Option<WrapperMode> {
 }
 
 fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
-    let zig = env::var_os("CARGO_ZIRILD_ZIG")
-        .ok_or_else(|| "CARGO_ZIRILD_ZIG is missing from wrapper environment".to_owned())?;
     let target = env::var_os("CARGO_ZIRILD_ZIG_TARGET")
         .ok_or_else(|| "CARGO_ZIRILD_ZIG_TARGET is missing from wrapper environment".to_owned())?;
     let optimize = env::var_os("CARGO_ZIRILD_OPTIMIZE")
         .ok_or_else(|| "CARGO_ZIRILD_OPTIMIZE is missing from wrapper environment".to_owned())?;
     let compiler_optimize = compiler_optimization_flag(&optimize)?;
 
-    let mut command = Command::new(zig);
-    match mode {
-        WrapperMode::Cc => {
-            command
-                .arg("cc")
-                .arg("-target")
-                .arg(&target)
-                .arg(compiler_optimize);
+    let ndk_fallback = env::var_os("CARGO_ZIRILD_NDK_FALLBACK").is_some();
+    let mut command = if ndk_fallback {
+        let tool = match mode {
+            WrapperMode::Cc | WrapperMode::Linker => env::var_os("CARGO_ZIRILD_NDK_CC"),
+            WrapperMode::Cxx => env::var_os("CARGO_ZIRILD_NDK_CXX"),
+            WrapperMode::Ar => env::var_os("CARGO_ZIRILD_NDK_AR"),
+            WrapperMode::Dlltool => {
+                return Err(
+                    "NDK fallback does not provide dlltool; Android builds must not request it"
+                        .into(),
+                );
+            }
         }
-        WrapperMode::Cxx => {
-            command
-                .arg("c++")
-                .arg("-target")
-                .arg(&target)
-                .arg(compiler_optimize);
+        .ok_or_else(|| "NDK fallback tool path is missing from wrapper environment".to_owned())?;
+        let mut command = Command::new(tool);
+        if matches!(
+            mode,
+            WrapperMode::Cc | WrapperMode::Cxx | WrapperMode::Linker
+        ) {
+            command.arg(compiler_optimize);
         }
-        WrapperMode::Linker => {
-            command
-                .arg("cc")
-                .arg("-target")
-                .arg(&target)
-                .arg(compiler_optimize);
+        command
+    } else {
+        let zig = env::var_os("CARGO_ZIRILD_ZIG")
+            .ok_or_else(|| "CARGO_ZIRILD_ZIG is missing from wrapper environment".to_owned())?;
+        let mut command = Command::new(zig);
+        match mode {
+            WrapperMode::Cc => {
+                command
+                    .arg("cc")
+                    .arg("-target")
+                    .arg(&target)
+                    .arg(compiler_optimize);
+            }
+            WrapperMode::Cxx => {
+                command
+                    .arg("c++")
+                    .arg("-target")
+                    .arg(&target)
+                    .arg(compiler_optimize);
+            }
+            WrapperMode::Linker => {
+                command
+                    .arg("cc")
+                    .arg("-target")
+                    .arg(&target)
+                    .arg(compiler_optimize);
+            }
+            WrapperMode::Ar => {
+                command.arg("ar");
+            }
+            WrapperMode::Dlltool => {
+                command.arg("dlltool");
+            }
         }
-        WrapperMode::Ar => {
-            command.arg("ar");
-        }
-        WrapperMode::Dlltool => {
-            command.arg("dlltool");
-        }
+        command
+    };
+    if matches!(
+        mode,
+        WrapperMode::Cc | WrapperMode::Cxx | WrapperMode::Linker
+    ) {
+        let native_arguments = if mode == WrapperMode::Linker {
+            wrapper_arguments("CARGO_ZIRILD_ANDROID_LINK_ARGS")
+        } else {
+            wrapper_arguments("CARGO_ZIRILD_ANDROID_CFLAGS")
+        };
+        command.args(native_arguments);
     }
     let arguments: Vec<_> = env::args_os().skip(1).collect();
     let windows_link = mode == WrapperMode::Linker
@@ -521,8 +959,9 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
 
     if env::var_os("CARGO_ZIRILD_TRACE").is_some() && mode != WrapperMode::Dlltool {
         eprintln!(
-            "cargo-zirild trace: invoking Zig in {mode:?} mode with {} arguments",
-            arguments.len()
+            "cargo-zirild trace: invoking {} in {mode:?} mode with {} arguments",
+            if ndk_fallback { "NDK LLVM" } else { "Zig" },
+            arguments.len(),
         );
     }
     let status = command.status();
@@ -531,8 +970,26 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
     if status.success() {
         Ok(())
     } else {
-        Err(format!("Zig {mode:?} failed with {status}"))
+        let tool = if ndk_fallback { "NDK LLVM" } else { "Zig" };
+        Err(format!("{tool} {mode:?} failed with {status}"))
     }
+}
+
+fn encode_wrapper_arguments(arguments: &[String]) -> String {
+    arguments.join("\n")
+}
+
+fn wrapper_arguments(name: &str) -> Vec<OsString> {
+    env::var(name)
+        .ok()
+        .map(|arguments| {
+            arguments
+                .split('\n')
+                .filter(|argument| !argument.is_empty())
+                .map(OsString::from)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn is_windows_runtime_argument(argument: &OsString) -> bool {
@@ -731,6 +1188,9 @@ fn compiler_optimization_flag(optimize: &OsString) -> Result<&'static str, Strin
 fn cargo_target_for(zig_target: &str) -> String {
     let pieces: Vec<_> = zig_target.split('-').collect();
     match pieces.as_slice() {
+        ["arm", "linux", "android"] | ["armv7", "linux", "android"] => {
+            "armv7-linux-androideabi".into()
+        }
         [architecture, "linux", "android"] => format!("{architecture}-linux-android"),
         [architecture, "linux", abi] => format!("{architecture}-unknown-linux-{abi}"),
         [architecture, "pc", "windows"] => format!("{architecture}-pc-windows-msvc"),
@@ -753,15 +1213,38 @@ fn zig_target_for(target: &str) -> String {
     }
 }
 
-fn warn_about_android_target(zig_target: &str) {
-    if zig_target.contains("-android") {
+fn warn_about_android_target(zig_target: &str, ndk: Option<&AndroidNdk>, ndk_fallback: bool) {
+    if let Some(ndk) = ndk {
+        if ndk_fallback {
+            eprintln!(
+                "cargo-zirild: Android NDK {} selected at '{}'; -ndkfaback will use its Clang/LLD tools directly.",
+                ndk.version,
+                ndk.root.display()
+            );
+        } else {
+            eprintln!(
+                "cargo-zirild: Android NDK {} selected at '{}'; its root and sysroot are exported to build scripts while Zig remains the compiler and final linker.",
+                ndk.version,
+                ndk.root.display()
+            );
+        }
+    }
+    if zig_target.contains("-android") && !ndk_fallback {
         eprintln!(
-            "cargo-zirild: note: this Zig distribution has no bundled Android libc. \
+            "cargo-zirild: note: this Zig distribution cannot currently link Android libc, including an NDK sysroot. \
+             Zirild will not fall back to NDK clang because that would violate its single Zig linker contract. \
              For a musl-based Android-compatible native build, try -target={} instead; \
              this is a musl Linux binary and not an Android-NDK-linked binary.",
-            zig_target.replacen("-android", "-musl", 1)
+            android_musl_target(zig_target)
         );
     }
+}
+
+fn android_musl_target(zig_target: &str) -> String {
+    zig_target
+        .split_once("-android")
+        .map(|(prefix, _)| format!("{prefix}-musl"))
+        .unwrap_or_else(|| zig_target.into())
 }
 
 #[cfg(test)]
@@ -942,6 +1425,94 @@ mod tests {
         assert_eq!(
             windows_definition_with_fallback_export("EXPORTS\n    real_export\n"),
             None
+        );
+    }
+
+    #[test]
+    fn orders_ndk_version_directories_numerically() {
+        assert!(
+            ndk_version_key(Path::new("27.2.12479018"))
+                < ndk_version_key(Path::new("30.0.14904198"))
+        );
+    }
+
+    #[test]
+    fn selects_ndk_versions_newest_first_or_by_exact_name() {
+        let candidates = vec![
+            PathBuf::from("27.2.12479018"),
+            PathBuf::from("30.0.14904198"),
+            PathBuf::from("26.3.11579264"),
+        ];
+        assert_eq!(
+            select_ndk_candidate(candidates.clone(), &AndroidOptions::default()),
+            Some(PathBuf::from("30.0.14904198"))
+        );
+        let indexed = AndroidOptions {
+            ndk_index: Some(1),
+            ..AndroidOptions::default()
+        };
+        assert_eq!(
+            select_ndk_candidate(candidates.clone(), &indexed),
+            Some(PathBuf::from("27.2.12479018"))
+        );
+        let exact = AndroidOptions {
+            ndk_version: Some("26.3.11579264".into()),
+            ..AndroidOptions::default()
+        };
+        assert_eq!(
+            select_ndk_candidate(candidates, &exact),
+            Some(PathBuf::from("26.3.11579264"))
+        );
+    }
+
+    #[test]
+    fn parses_android_ndk_and_toolchain_options_without_forwarding_to_cargo() {
+        let options = parse_args(vec![
+            "-target=x86_64-linux-android".into(),
+            "-nindx=1".into(),
+            "-android-api=24".into(),
+            "-DANDROID_ABI=x86_64".into(),
+            "-DANDROID_STL=c++_shared".into(),
+            "-android-cflag=-fPIC".into(),
+            "-android-link-arg=-Wl,--build-id".into(),
+            "-ndkfaback".into(),
+        ])
+        .unwrap();
+        assert_eq!(options.zig_target, "x86_64-linux-android.24");
+        assert_eq!(options.android.ndk_index, Some(1));
+        assert_eq!(options.android.api_level, Some(24));
+        assert_eq!(options.android.abi.as_deref(), Some("x86_64"));
+        assert_eq!(options.android.stl.as_deref(), Some("c++_shared"));
+        assert_eq!(options.android.cflags, vec!["-fPIC"]);
+        assert_eq!(options.android.link_args, vec!["-Wl,--build-id"]);
+        assert!(options.android.ndk_fallback);
+        assert!(options.cargo_args.is_empty());
+    }
+
+    #[test]
+    fn rejects_conflicting_ndk_selectors_and_android_abi() {
+        assert!(
+            parse_args(vec![
+                "-target=x86_64-linux-android".into(),
+                "-ndkversion=30.0.14904198".into(),
+                "-nindx=0".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args(vec![
+                "-target=x86_64-linux-android".into(),
+                "-android-abi=arm64-v8a".into(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn removes_android_api_level_from_musl_compatibility_suggestion() {
+        assert_eq!(
+            android_musl_target("x86_64-linux-android.24"),
+            "x86_64-linux-musl"
         );
     }
 }
