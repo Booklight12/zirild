@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.4 - 2026-07-14
+
+- Add Cargo command selection for build, check, run, test, bench, rustc,
+  clippy, and doc, while keeping build as the default.
+- Support `cargo zirild -target=<target> run` and preserve executable arguments
+  following `--`.
+- Avoid confusing Cargo option values such as `--bin run` with the selected
+  Cargo command.
+- Verify native execution for Windows MSVC and Windows GNU, full linking for
+  Linux GNU, and target checking for the locally installed Android targets.
+
 ## 0.1.3 - 2026-07-14
 
 - Fix Cargo's injected zirild subcommand argument from being forwarded to the

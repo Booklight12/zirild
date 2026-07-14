@@ -8,10 +8,10 @@ use std::{
     process::{Command, ExitCode},
 };
 
-const USAGE: &str = r#"cargo-zirild - build a Rust Cargo project with the Zig toolchain
+const USAGE: &str = r#"cargo-zirild - run Cargo commands with the Zig toolchain
 
 Usage:
-  cargo zirild -target=<zig-target> [options] [cargo build options]
+  cargo zirild -target=<zig-target> [options] [cargo-command] [cargo options]
 
 Required:
   -target=<zig-target>        Zig target, e.g. x86_64-linux-musl
@@ -26,9 +26,13 @@ Other options:
   -zigpatch=<path>            Use this Zig executable/directory before Zig_home
   -h, --help                  Show this help
 
-All remaining arguments are passed to cargo build, for example --features,
---package, --bin, and --locked. Do not pass Cargo's --target: -target is the
-single source of truth and is converted to Cargo's corresponding Rust triple.
+Cargo command:
+  build (default), check, run, test, bench, rustc, clippy, or doc
+
+All remaining arguments are passed to the selected Cargo command, for example
+--features, --package, --bin, --locked, and run arguments after --. Do not pass
+Cargo's --target: -target is the single source of truth and is converted to
+Cargo's corresponding Rust triple.
 
 Zig location:
   Set Zig_home to the Zig installation directory or the full path to zig/zig.exe.
@@ -49,6 +53,7 @@ struct BuildOptions {
     cargo_target: String,
     optimize: String,
     zig_patch: Option<PathBuf>,
+    cargo_command: String,
     cargo_args: Vec<OsString>,
 }
 
@@ -76,7 +81,11 @@ fn run_driver(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     if args.first().is_some_and(|argument| argument == "zirild") {
         args.remove(0);
     }
-    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+    if args
+        .iter()
+        .take_while(|argument| *argument != "--")
+        .any(|argument| argument == "--help" || argument == "-h")
+    {
         print!("{USAGE}");
         return Ok(());
     }
@@ -96,17 +105,26 @@ fn parse_args(args: Vec<OsString>) -> Result<BuildOptions, String> {
     let mut zig_patch = None;
     let mut release = false;
     let mut small = false;
+    let mut cargo_command = None;
     let mut cargo_args = Vec::new();
     let mut passthrough = false;
+    let mut cargo_value_expected = false;
 
     for argument in args {
         let text = argument.to_string_lossy();
+        if passthrough {
+            cargo_args.push(argument);
+            continue;
+        }
+        if cargo_value_expected {
+            cargo_args.push(argument);
+            cargo_value_expected = false;
+            continue;
+        }
         // Cargo may inject the external subcommand name before or after user
         // options, depending on the invoking Cargo version and platform.
-        if argument == "zirild" {
+        if argument == "zirild" && cargo_command.is_none() {
             continue;
-        } else if passthrough {
-            cargo_args.push(argument);
         } else if let Some(value) = text.strip_prefix("-target=") {
             target = Some(value.to_owned());
         } else if let Some(value) = text.strip_prefix("--target=") {
@@ -125,9 +143,15 @@ fn parse_args(args: Vec<OsString>) -> Result<BuildOptions, String> {
             small = true;
         } else if argument == "--" {
             passthrough = true;
+            cargo_args.push(argument);
         } else if argument == "--target" || argument == "-target" {
             return Err("use -target=<zig-target>, not a separate Cargo --target".into());
+        } else if cargo_command.is_none()
+            && let Some(command) = cargo_command_name(&text)
+        {
+            cargo_command = Some(command.to_owned());
         } else {
+            cargo_value_expected = cargo_option_takes_value(&text);
             cargo_args.push(argument);
         }
     }
@@ -153,8 +177,49 @@ fn parse_args(args: Vec<OsString>) -> Result<BuildOptions, String> {
         cargo_target,
         optimize,
         zig_patch,
+        cargo_command: cargo_command.unwrap_or_else(|| "build".into()),
         cargo_args,
     })
+}
+
+fn cargo_command_name(argument: &str) -> Option<&'static str> {
+    match argument {
+        "build" => Some("build"),
+        "check" => Some("check"),
+        "run" => Some("run"),
+        "test" => Some("test"),
+        "bench" => Some("bench"),
+        "rustc" => Some("rustc"),
+        "clippy" => Some("clippy"),
+        "doc" => Some("doc"),
+        _ => None,
+    }
+}
+
+/// Cargo options whose following value may itself be a supported command name.
+/// Tracking these prevents `--bin run` and similar arguments from being
+/// mistaken for the command selected for this invocation.
+fn cargo_option_takes_value(argument: &str) -> bool {
+    matches!(
+        argument,
+        "-p" | "--package"
+            | "--exclude"
+            | "-j"
+            | "--jobs"
+            | "-F"
+            | "--features"
+            | "--bin"
+            | "--example"
+            | "--test"
+            | "--bench"
+            | "--profile"
+            | "--manifest-path"
+            | "--message-format"
+            | "--target-dir"
+            | "--artifact-dir"
+            | "--color"
+            | "--config"
+    )
 }
 
 fn validate_optimize(value: &str) -> Result<String, String> {
@@ -279,7 +344,7 @@ fn make_wrappers() -> Result<Wrappers, String> {
 fn run_cargo(options: &BuildOptions, zig: &Path, wrappers: &Wrappers) -> Result<(), String> {
     let mut command = Command::new("cargo");
     command
-        .arg("build")
+        .arg(&options.cargo_command)
         .arg("--target")
         .arg(&options.cargo_target)
         .args(&options.cargo_args);
@@ -318,13 +383,13 @@ fn run_cargo(options: &BuildOptions, zig: &Path, wrappers: &Wrappers) -> Result<
 
     if is_msvc {
         eprintln!(
-            "+ cargo build --target {} (MSVC toolchain / {})",
-            options.cargo_target, options.optimize
+            "+ cargo {} --target {} (MSVC toolchain / {})",
+            options.cargo_command, options.cargo_target, options.optimize
         );
     } else {
         eprintln!(
-            "+ cargo build --target {} (Zig {} / {})",
-            options.cargo_target, options.zig_target, options.optimize
+            "+ cargo {} --target {} (Zig {} / {})",
+            options.cargo_command, options.cargo_target, options.zig_target, options.optimize
         );
     }
     let status = command
@@ -333,7 +398,10 @@ fn run_cargo(options: &BuildOptions, zig: &Path, wrappers: &Wrappers) -> Result<
     if status.success() {
         Ok(())
     } else {
-        Err(format!("cargo build failed with {status}"))
+        Err(format!(
+            "cargo {} failed with {status}",
+            options.cargo_command
+        ))
     }
 }
 
@@ -371,21 +439,21 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
                 .arg("cc")
                 .arg("-target")
                 .arg(&target)
-                .arg(&compiler_optimize);
+                .arg(compiler_optimize);
         }
         WrapperMode::Cxx => {
             command
                 .arg("c++")
                 .arg("-target")
                 .arg(&target)
-                .arg(&compiler_optimize);
+                .arg(compiler_optimize);
         }
         WrapperMode::Linker => {
             command
                 .arg("cc")
                 .arg("-target")
                 .arg(&target)
-                .arg(&compiler_optimize);
+                .arg(compiler_optimize);
         }
         WrapperMode::Ar => {
             command.arg("ar");
@@ -451,13 +519,11 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
         command.arg("-lunwind");
     }
 
-    if env::var_os("CARGO_ZIRILD_TRACE").is_some() {
-        if mode != WrapperMode::Dlltool {
-            eprintln!(
-                "cargo-zirild trace: invoking Zig in {mode:?} mode with {} arguments",
-                arguments.len()
-            );
-        }
+    if env::var_os("CARGO_ZIRILD_TRACE").is_some() && mode != WrapperMode::Dlltool {
+        eprintln!(
+            "cargo-zirild trace: invoking Zig in {mode:?} mode with {} arguments",
+            arguments.len()
+        );
     }
     let status = command.status();
     restore_response_files(response_files);
@@ -793,7 +859,57 @@ mod tests {
         let options =
             parse_args(vec!["-target=x86_64-linux-musl".into(), "zirild".into()]).unwrap();
         assert!(options.cargo_args.is_empty());
+        assert_eq!(options.cargo_command, "build");
         assert_eq!(options.zig_target, "x86_64-linux-musl");
+    }
+
+    #[test]
+    fn selects_cargo_run_after_zirild_options() {
+        let options = parse_args(vec![
+            "-target=x86_64-pc-windows-msvc".into(),
+            "run".into(),
+            "--release".into(),
+        ])
+        .unwrap();
+        assert_eq!(options.cargo_command, "run");
+        assert_eq!(options.cargo_args, vec![OsString::from("--release")]);
+        assert_eq!(options.optimize, "ReleaseFast");
+    }
+
+    #[test]
+    fn preserves_separator_and_run_arguments() {
+        let options = parse_args(vec![
+            "-target=x86_64-pc-windows-msvc".into(),
+            "run".into(),
+            "--".into(),
+            "--help".into(),
+            "run".into(),
+        ])
+        .unwrap();
+        assert_eq!(options.cargo_command, "run");
+        assert_eq!(
+            options.cargo_args,
+            vec![
+                OsString::from("--"),
+                OsString::from("--help"),
+                OsString::from("run")
+            ]
+        );
+    }
+
+    #[test]
+    fn does_not_treat_cargo_option_value_as_command() {
+        let options = parse_args(vec![
+            "-target=x86_64-pc-windows-msvc".into(),
+            "--bin".into(),
+            "run".into(),
+        ])
+        .unwrap();
+        assert_eq!(options.cargo_command, "build");
+        assert_eq!(
+            options.cargo_args,
+            vec![OsString::from("--bin"), OsString::from("run")]
+        );
     }
 
     #[test]
