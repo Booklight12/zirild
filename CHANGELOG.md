@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Ignore duplicate `--target` arguments injected by native build helpers such
+  as `cc-rs`, preserving Zirild's Zig-compatible target mapping for C and C++.
+- Disable Zig's implicit C/C++ undefined-behavior sanitizer instrumentation by
+  default so mixed Rust/native links do not require an unrequested UBSan
+  runtime. Explicit sanitizer flags can still override this default.
+- Validate mixed Rust, C, and C++ builds for Linux GNU, Windows GNU, and Windows
+  MSVC; execute the Linux ELF in Ubuntu on WSL2 and both PE executables on the
+  Windows host.
+
 ## 0.1.5 - 2026-07-14
 
 - Add Android NDK discovery from `Ndk_home`, selecting the newest installed
@@ -11,8 +22,8 @@
 - Add explicit `-ndkfallback` support for Android NDK Clang/LLD and LLVM ar.
   This emits a prominent warning because the final file is no longer linked by
   Zig.
-- Validate the five locally installed Rust targets against the `t1` project,
-  including NDK-linked Android ELF outputs.
+- Validate the five locally installed Rust targets against a temporary external
+  fixture, including NDK-linked Android ELF outputs.
 - Filter the Windows GNU auto-image-base switches that Zig LLD ignores, removing
   its non-actionable linker warning.
 

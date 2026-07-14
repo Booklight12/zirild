@@ -121,10 +121,9 @@ the C compiler, C++ compiler, linker, and archiver to NDK Clang/LLD and LLVM ar.
 ## Current target validation
 
 The following matrix was compiled on Windows against the locally installed Rust
-targets on 2026-07-14. The validation project was
-`D:\User\Document\RustProject\t1`, a standalone Rust binary with no native
-dependencies. This validates compilation and linker output, not execution on a
-device or foreign operating system.
+targets on 2026-07-14 using a temporary standalone validation crate outside the
+published package. This validates compilation and linker output, not execution
+on a device or foreign operating system.
 
 | Rust target | Zirild invocation | Native linker | Result |
 | --- | --- | --- | --- |
@@ -138,6 +137,49 @@ The Android artifacts were inspected with the selected NDK's `llvm-readelf`.
 For Windows GNU, Zirild filters Rust's `--enable/--disable-auto-image-base`
 switches because Zig LLD reports them as unimplemented and ignores them; this
 removes the warning without changing Zig's image-base behavior.
+
+### Mixed Rust/C/C++ Linux execution
+
+A temporary external validation crate used a `build.rs` with `cc-rs`, one C
+translation unit, one C++17 translation unit, and Rust `extern "C"` calls. The
+fixture is intentionally not included in the published crate. Its build trace
+confirmed that Zirild invoked Zig in `Cc`, `Cxx`, `Ar`, and final `Linker` modes
+for `x86_64-unknown-linux-gnu`.
+
+```powershell
+cargo zirild -target=x86_64-unknown-linux-gnu build
+wsl -d Ubuntu -- /mnt/d/path/to/project/target/x86_64-unknown-linux-gnu/debug/app
+```
+
+The resulting file was an x86-64 PIE ELF dynamically linked against the Ubuntu
+WSL2 glibc environment. Its runtime output was:
+
+```text
+Rust -> C: 42; Rust -> C++: 42
+```
+
+This test exposed two native-wrapper issues that are fixed in the current
+source: `cc-rs` target overrides are filtered so they cannot replace Zirild's
+Zig target, and implicit Zig UBSan instrumentation is disabled unless the
+caller explicitly requests sanitizer flags.
+
+### Mixed Rust/C/C++ Windows execution
+
+The same native sources were built and run on the Windows host through both
+installed Windows targets:
+
+| Rust target | C/C++ and linker backend | Trace evidence | Runtime result |
+| --- | --- | --- | --- |
+| `x86_64-pc-windows-gnu` | Zig `cc`, `c++`, `ar`, and LLD | `Cc`, `Cxx`, `Ar`, and `Linker` wrapper modes invoked | passed |
+| `x86_64-pc-windows-msvc` | system Microsoft C/C++ compiler, librarian, and linker | MSVC 19.51 x64 compiler detected by `cc-rs` | passed |
+
+Both PE executables completed with exit code 0 and printed:
+
+```text
+Rust -> C: 42; Rust -> C++: 42
+```
+
+The final non-tracing builds completed without compiler or linker warnings.
 
 `build` is the default Cargo command. You can also select `check`, `run`,
 `test`, `bench`, `rustc`, `clippy`, or `doc`. The command may follow the Zirild

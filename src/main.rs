@@ -889,6 +889,13 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
         }
         command
     };
+    // Zig's C/C++ driver may inject UBSan checks based on its safety defaults,
+    // while rustc's final native link does not request the matching sanitizer
+    // runtime. Zirild's optimization contract is the explicit Clang -O flag,
+    // so keep native objects self-contained unless callers opt into sanitizers.
+    if matches!(mode, WrapperMode::Cc | WrapperMode::Cxx) {
+        command.arg("-fno-sanitize=undefined");
+    }
     if matches!(
         mode,
         WrapperMode::Cc | WrapperMode::Cxx | WrapperMode::Linker
@@ -917,6 +924,16 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
     let mut argument_index = 0;
     while argument_index < arguments.len() {
         let argument = &arguments[argument_index];
+        if matches!(mode, WrapperMode::Cc | WrapperMode::Cxx) {
+            if argument == "--target" || argument == "-target" {
+                argument_index += 2;
+                continue;
+            }
+            if is_embedded_target_argument(argument) {
+                argument_index += 1;
+                continue;
+            }
+        }
         if mode == WrapperMode::Dlltool && argument == "--temp-prefix" {
             argument_index += 2;
             continue;
@@ -975,6 +992,11 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
         let tool = if ndk_fallback { "NDK LLVM" } else { "Zig" };
         Err(format!("{tool} {mode:?} failed with {status}"))
     }
+}
+
+fn is_embedded_target_argument(argument: &OsString) -> bool {
+    let argument = argument.to_string_lossy();
+    argument.starts_with("--target=") || argument.starts_with("-target=")
 }
 
 fn encode_wrapper_arguments(arguments: &[String]) -> String {
@@ -1324,6 +1346,17 @@ mod tests {
             compiler_optimization_flag(&"ReleaseSmall".into()).unwrap(),
             "-Oz"
         );
+    }
+
+    #[test]
+    fn recognizes_native_compiler_target_overrides() {
+        assert!(is_embedded_target_argument(&OsString::from(
+            "--target=x86_64-unknown-linux-gnu"
+        )));
+        assert!(is_embedded_target_argument(&OsString::from(
+            "-target=aarch64-linux-android"
+        )));
+        assert!(!is_embedded_target_argument(&OsString::from("-m64")));
     }
 
     #[test]
