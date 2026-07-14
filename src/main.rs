@@ -19,12 +19,13 @@ Required:
 Zig optimisation:
   (default/dev)               ReleaseSafe
   --release                   ReleaseFast
-  -Z                          ReleaseSmall
-  -ZigOptimize=<mode>         Explicit: Debug, ReleaseSafe, ReleaseFast, ReleaseSmall
+  --zig-release-small         ReleaseSmall
+  --zig-opt=<mode>            Explicit: debug/safe/fast/small or a full Zig mode name
 
 Other options:
-  -zigpatch=<path>            Use this Zig executable/directory before Zig_home
-  -ndkversion=<version>       Android: select an exact NDK version below Ndk_home
+  --zig-path=<path>           Use this Zig executable/directory before environment lookup
+  --ndk-path=<path>           Android: use this NDK or SDK ndk directory
+  -ndkversion=<version>       Android: select an exact version below the NDK search path
   -nindx=<index>              Android: select NDK by newest-first index (0 = newest)
   -android-api=<level>        Android: use an Android API level for Zig's target
   -android-abi=<abi>          Android: validate ABI (arm64-v8a, x86_64, etc.)
@@ -32,25 +33,28 @@ Other options:
   -android-cflag=<flag>       Android: pass one flag to the selected native compiler
   -android-link-arg=<flag>    Android: pass one flag to the selected native linker
   -ndkfallback                Android: explicitly use NDK Clang/LLD instead of Zig
+  --windows-runtime=<policy>  Windows GNU: auto, zig, or preserve
+  --preserve-linker-args      Alias for --windows-runtime=preserve
+  --trace                     Print native wrapper invocation details
   -h, --help                  Show this help
 
 Cargo command:
   build (default), check, run, test, bench, rustc, clippy, or doc
 
-All remaining arguments are passed to the selected Cargo command, for example
---features, --package, --bin, --locked, and run arguments after --. Do not pass
-Cargo's --target: -target is the single source of truth and is converted to
-Cargo's corresponding Rust triple.
+The Cargo command, when present, must precede its Cargo options. Arguments after
+that command are passed to Cargo; Zirild only observes --release and rejects a
+second Cargo --target. With no command, the first non-Zirild option starts the
+default build's Cargo arguments. Cargo's -Z and its following value are
+preserved. Zirild's -target is the single source of truth.
 
 Zig location:
-  Set Zig_home to the Zig installation directory or the full path to zig/zig.exe.
+  Lookup order: --zig-path, CARGO_ZIRILD_ZIG_PATH, ZIG, ZIG_HOME, Zig_home,
+  then zig on PATH. -zigpatch remains accepted as a compatibility alias.
 
 Android NDK location:
-  Set Ndk_home to either an NDK installation or Android SDK's ndk directory
-  containing version subdirectories. Zirild always keeps Zig as the final
-  compiler/linker; it never silently replaces it with NDK clang. CMake-style
-  -DANDROID_ABI=..., -DANDROID_PLATFORM=android-<api>, and -DANDROID_STL=...
-  are also parsed in Android mode. -ndkfallback is the explicit LLVM fallback.
+  Lookup includes --ndk-path, CARGO_ZIRILD_NDK_PATH, ANDROID_NDK_HOME,
+  ANDROID_NDK_ROOT, Ndk_home, and the ndk directory below ANDROID_SDK_ROOT or
+  ANDROID_HOME. Zirild never silently replaces Zig with NDK clang.
 "#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,7 +71,10 @@ struct BuildOptions {
     zig_target: String,
     cargo_target: String,
     optimize: String,
+    force_native_optimize: bool,
     zig_patch: Option<PathBuf>,
+    windows_runtime: WindowsRuntimePolicy,
+    trace: bool,
     cargo_command: String,
     cargo_args: Vec<OsString>,
     android: AndroidOptions,
@@ -75,6 +82,7 @@ struct BuildOptions {
 
 #[derive(Debug, Default)]
 struct AndroidOptions {
+    ndk_path: Option<PathBuf>,
     ndk_version: Option<String>,
     ndk_index: Option<usize>,
     api_level: Option<u32>,
@@ -83,6 +91,39 @@ struct AndroidOptions {
     cflags: Vec<String>,
     link_args: Vec<String>,
     ndk_fallback: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum WindowsRuntimePolicy {
+    #[default]
+    Auto,
+    Zig,
+    Preserve,
+}
+
+impl WindowsRuntimePolicy {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "zig" => Ok(Self::Zig),
+            "preserve" => Ok(Self::Preserve),
+            _ => Err(format!(
+                "invalid --windows-runtime '{value}'; use auto, zig, or preserve"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Zig => "zig",
+            Self::Preserve => "preserve",
+        }
+    }
+
+    fn rewrites_runtime(self) -> bool {
+        !matches!(self, Self::Preserve)
+    }
 }
 
 #[derive(Debug)]
@@ -119,11 +160,7 @@ fn run_driver(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     if args.first().is_some_and(|argument| argument == "zirild") {
         args.remove(0);
     }
-    if args
-        .iter()
-        .take_while(|argument| *argument != "--")
-        .any(|argument| argument == "--help" || argument == "-h")
-    {
+    if requests_driver_help(&args) {
         print!("{USAGE}");
         return Ok(());
     }
@@ -153,27 +190,82 @@ fn run_driver(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     result
 }
 
+fn requests_driver_help(arguments: &[OsString]) -> bool {
+    for argument in arguments {
+        let text = argument.to_string_lossy();
+        if argument == "zirild" {
+            continue;
+        }
+        if argument == "--help" || argument == "-h" {
+            return true;
+        }
+        if cargo_command_name(&text).is_some() || !is_zirild_option_spelling(&text) {
+            return false;
+        }
+    }
+    false
+}
+
+fn is_zirild_option_spelling(argument: &str) -> bool {
+    argument == "--release"
+        || argument == "--zig-release-small"
+        || argument == "-ndkfallback"
+        || argument == "--preserve-linker-args"
+        || argument == "--trace"
+        || argument.starts_with("-target=")
+        || argument.starts_with("--target=")
+        || argument.starts_with("--zig-opt=")
+        || argument.starts_with("-ZigOptimize=")
+        || argument.starts_with("--zig-path=")
+        || argument.starts_with("-zigpatch=")
+        || argument.starts_with("--ndk-path=")
+        || argument.starts_with("-ndkversion=")
+        || argument.starts_with("-nindx=")
+        || argument.starts_with("-android-api=")
+        || argument.starts_with("-android-abi=")
+        || argument.starts_with("-android-stl=")
+        || argument.starts_with("-android-cflag=")
+        || argument.starts_with("-android-link-arg=")
+        || argument.starts_with("-DANDROID_ABI=")
+        || argument.starts_with("-DANDROID_PLATFORM=")
+        || argument.starts_with("-DANDROID_STL=")
+        || argument.starts_with("--windows-runtime=")
+}
+
 fn parse_args(args: Vec<OsString>) -> Result<BuildOptions, String> {
     let mut target = None;
     let mut explicit_optimize = None;
     let mut zig_patch = None;
     let mut release = false;
-    let mut small = false;
     let mut cargo_command = None;
     let mut cargo_args = Vec::new();
     let mut android = AndroidOptions::default();
-    let mut passthrough = false;
-    let mut cargo_value_expected = false;
+    let mut cargo_phase = false;
+    let mut executable_arguments = false;
+    let mut windows_runtime = WindowsRuntimePolicy::default();
+    let mut trace = false;
 
     for argument in args {
         let text = argument.to_string_lossy();
-        if passthrough {
+        if cargo_phase {
+            if !executable_arguments
+                && (argument == "--target"
+                    || argument == "-target"
+                    || text.starts_with("--target=")
+                    || text.starts_with("-target="))
+            {
+                return Err(
+                    "use Zirild's -target=<zig-target>, not Cargo's --target after the command"
+                        .into(),
+                );
+            }
+            if !executable_arguments && argument == "--release" {
+                release = true;
+            }
+            if argument == "--" {
+                executable_arguments = true;
+            }
             cargo_args.push(argument);
-            continue;
-        }
-        if cargo_value_expected {
-            cargo_args.push(argument);
-            cargo_value_expected = false;
             continue;
         }
         // Cargo may inject the external subcommand name before or after user
@@ -184,13 +276,26 @@ fn parse_args(args: Vec<OsString>) -> Result<BuildOptions, String> {
             target = Some(value.to_owned());
         } else if let Some(value) = text.strip_prefix("--target=") {
             target = Some(value.to_owned());
-        } else if let Some(value) = text.strip_prefix("-ZigOptimize=") {
+        } else if let Some(value) = text
+            .strip_prefix("--zig-opt=")
+            .or_else(|| text.strip_prefix("-ZigOptimize="))
+        {
             explicit_optimize = Some(validate_optimize(value)?);
-        } else if let Some(value) = text.strip_prefix("-zigpatch=") {
+        } else if argument == "--zig-release-small" {
+            explicit_optimize = Some("ReleaseSmall".into());
+        } else if let Some(value) = text
+            .strip_prefix("--zig-path=")
+            .or_else(|| text.strip_prefix("-zigpatch="))
+        {
             if value.is_empty() {
-                return Err("-zigpatch cannot be empty".into());
+                return Err("--zig-path cannot be empty".into());
             }
             zig_patch = Some(PathBuf::from(value));
+        } else if let Some(value) = text.strip_prefix("--ndk-path=") {
+            if value.is_empty() {
+                return Err("--ndk-path cannot be empty".into());
+            }
+            android.ndk_path = Some(PathBuf::from(value));
         } else if let Some(value) = text.strip_prefix("-ndkversion=") {
             if value.is_empty() {
                 return Err("-ndkversion cannot be empty".into());
@@ -224,6 +329,12 @@ fn parse_args(args: Vec<OsString>) -> Result<BuildOptions, String> {
             android.link_args.push(value.into());
         } else if argument == "-ndkfallback" {
             android.ndk_fallback = true;
+        } else if let Some(value) = text.strip_prefix("--windows-runtime=") {
+            windows_runtime = WindowsRuntimePolicy::parse(value)?;
+        } else if argument == "--preserve-linker-args" {
+            windows_runtime = WindowsRuntimePolicy::Preserve;
+        } else if argument == "--trace" {
+            trace = true;
         } else if let Some(value) = text.strip_prefix("-DANDROID_ABI=") {
             if value.is_empty() {
                 return Err("-DANDROID_ABI cannot be empty".into());
@@ -239,10 +350,9 @@ fn parse_args(args: Vec<OsString>) -> Result<BuildOptions, String> {
         } else if argument == "--release" {
             release = true;
             cargo_args.push(argument);
-        } else if argument == "-Z" {
-            small = true;
         } else if argument == "--" {
-            passthrough = true;
+            cargo_phase = true;
+            executable_arguments = true;
             cargo_args.push(argument);
         } else if argument == "--target" || argument == "-target" {
             return Err("use -target=<zig-target>, not a separate Cargo --target".into());
@@ -250,8 +360,12 @@ fn parse_args(args: Vec<OsString>) -> Result<BuildOptions, String> {
             && let Some(command) = cargo_command_name(&text)
         {
             cargo_command = Some(command.to_owned());
+            cargo_phase = true;
         } else {
-            cargo_value_expected = cargo_option_takes_value(&text);
+            // The first non-Zirild argument starts Cargo's argument phase for
+            // the default build. Do not guess whether later values happen to
+            // spell a Cargo command name.
+            cargo_phase = true;
             cargo_args.push(argument);
         }
     }
@@ -260,10 +374,9 @@ fn parse_args(args: Vec<OsString>) -> Result<BuildOptions, String> {
     if target.is_empty() {
         return Err("-target cannot be empty".into());
     }
+    let force_native_optimize = explicit_optimize.is_some();
     let optimize = explicit_optimize.unwrap_or_else(|| {
-        if small {
-            "ReleaseSmall".into()
-        } else if release {
+        if release {
             "ReleaseFast".into()
         } else {
             "ReleaseSafe".into()
@@ -271,6 +384,9 @@ fn parse_args(args: Vec<OsString>) -> Result<BuildOptions, String> {
     });
     let cargo_target = cargo_target_for(&target);
     let mut zig_target = zig_target_for(&target);
+    if windows_runtime != WindowsRuntimePolicy::Auto && !cargo_target.ends_with("-pc-windows-gnu") {
+        return Err("--windows-runtime is only valid for a Windows GNU -target".into());
+    }
     if is_android_target(&cargo_target) {
         validate_android_options(&android, &cargo_target)?;
         if let Some(api_level) = android.api_level {
@@ -283,7 +399,10 @@ fn parse_args(args: Vec<OsString>) -> Result<BuildOptions, String> {
         zig_target,
         cargo_target,
         optimize,
+        force_native_optimize,
         zig_patch,
+        windows_runtime,
+        trace,
         cargo_command: cargo_command.unwrap_or_else(|| "build".into()),
         cargo_args,
         android,
@@ -292,7 +411,8 @@ fn parse_args(args: Vec<OsString>) -> Result<BuildOptions, String> {
 
 impl AndroidOptions {
     fn is_configured(&self) -> bool {
-        self.ndk_version.is_some()
+        self.ndk_path.is_some()
+            || self.ndk_version.is_some()
             || self.ndk_index.is_some()
             || self.api_level.is_some()
             || self.abi.is_some()
@@ -351,50 +471,51 @@ fn cargo_command_name(argument: &str) -> Option<&'static str> {
     }
 }
 
-/// Cargo options whose following value may itself be a supported command name.
-/// Tracking these prevents `--bin run` and similar arguments from being
-/// mistaken for the command selected for this invocation.
-fn cargo_option_takes_value(argument: &str) -> bool {
-    matches!(
-        argument,
-        "-p" | "--package"
-            | "--exclude"
-            | "-j"
-            | "--jobs"
-            | "-F"
-            | "--features"
-            | "--bin"
-            | "--example"
-            | "--test"
-            | "--bench"
-            | "--profile"
-            | "--manifest-path"
-            | "--message-format"
-            | "--target-dir"
-            | "--artifact-dir"
-            | "--color"
-            | "--config"
-    )
-}
-
 fn validate_optimize(value: &str) -> Result<String, String> {
     match value {
         "Debug" | "ReleaseSafe" | "ReleaseFast" | "ReleaseSmall" => Ok(value.into()),
+        "debug" => Ok("Debug".into()),
+        "safe" | "release-safe" => Ok("ReleaseSafe".into()),
+        "fast" | "release-fast" => Ok("ReleaseFast".into()),
+        "small" | "release-small" => Ok("ReleaseSmall".into()),
         _ => Err(format!(
-            "invalid -ZigOptimize '{value}'; use Debug, ReleaseSafe, ReleaseFast, or ReleaseSmall"
+            "invalid --zig-opt '{value}'; use debug, safe, fast, small, or a Zig mode name"
         )),
     }
 }
 
 fn zig_executable(zig_patch: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(path) = zig_patch {
-        return validate_zig_path(path, "-zigpatch");
+        return validate_zig_path(path, "--zig-path");
     }
 
-    let home = env::var_os("Zig_home").ok_or_else(|| {
-        "Zig_home is not set; set Zig_home or pass -zigpatch=<zig path>".to_owned()
-    })?;
-    validate_zig_path(&PathBuf::from(home), "Zig_home")
+    for name in ["CARGO_ZIRILD_ZIG_PATH", "ZIG", "ZIG_HOME", "Zig_home"] {
+        if let Some(path) = env::var_os(name).filter(|value| !value.is_empty()) {
+            return validate_zig_path(&PathBuf::from(path), name);
+        }
+    }
+    if let Some(path) = executable_on_path("zig") {
+        return verify_zig(&path, "PATH");
+    }
+    Err(
+        "Zig was not found; pass --zig-path, set CARGO_ZIRILD_ZIG_PATH/ZIG/ZIG_HOME, or add zig to PATH"
+            .into(),
+    )
+}
+
+fn executable_on_path(name: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    let executable_names: Vec<OsString> = if cfg!(windows) {
+        vec![format!("{name}.exe").into(), name.into()]
+    } else {
+        vec![name.into()]
+    };
+    env::split_paths(&path).find_map(|directory| {
+        executable_names
+            .iter()
+            .map(|executable| directory.join(executable))
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 fn validate_zig_path(path: &Path, source: &str) -> Result<PathBuf, String> {
@@ -462,11 +583,8 @@ fn android_abi_for_target(target: &str) -> Option<&'static str> {
 }
 
 fn android_ndk(options: &AndroidOptions, cargo_target: &str) -> Result<AndroidNdk, String> {
-    let home = env::var_os("Ndk_home").ok_or_else(|| {
-        "Ndk_home is not set; set it to an Android NDK installation or Android SDK ndk directory"
-            .to_owned()
-    })?;
-    let root = select_ndk_root(Path::new(&home), options)?;
+    let (home, source) = android_ndk_search_path(options)?;
+    let root = select_ndk_root(&home, options, source)?;
     let version = root
         .file_name()
         .and_then(|name| name.to_str())
@@ -531,6 +649,31 @@ fn android_ndk(options: &AndroidOptions, cargo_target: &str) -> Result<AndroidNd
     })
 }
 
+fn android_ndk_search_path(options: &AndroidOptions) -> Result<(PathBuf, &'static str), String> {
+    if let Some(path) = &options.ndk_path {
+        return Ok((path.clone(), "--ndk-path"));
+    }
+    for name in [
+        "CARGO_ZIRILD_NDK_PATH",
+        "ANDROID_NDK_HOME",
+        "ANDROID_NDK_ROOT",
+        "Ndk_home",
+    ] {
+        if let Some(path) = env::var_os(name).filter(|value| !value.is_empty()) {
+            return Ok((PathBuf::from(path), name));
+        }
+    }
+    for name in ["ANDROID_SDK_ROOT", "ANDROID_HOME"] {
+        if let Some(path) = env::var_os(name).filter(|value| !value.is_empty()) {
+            return Ok((PathBuf::from(path).join("ndk"), name));
+        }
+    }
+    Err(
+        "Android NDK was not found; pass --ndk-path, set CARGO_ZIRILD_NDK_PATH/ANDROID_NDK_HOME/ANDROID_NDK_ROOT, or configure an Android SDK root"
+            .into(),
+    )
+}
+
 fn android_compiler_prefix(target: &str) -> Result<(&'static str, u32), String> {
     match target {
         "aarch64-linux-android" => Ok(("aarch64-linux-android", 21)),
@@ -541,7 +684,7 @@ fn android_compiler_prefix(target: &str) -> Result<(&'static str, u32), String> 
     }
 }
 
-fn select_ndk_root(home: &Path, options: &AndroidOptions) -> Result<PathBuf, String> {
+fn select_ndk_root(home: &Path, options: &AndroidOptions, source: &str) -> Result<PathBuf, String> {
     let is_ndk_root = |path: &Path| {
         path.join("toolchains")
             .join("llvm")
@@ -551,23 +694,25 @@ fn select_ndk_root(home: &Path, options: &AndroidOptions) -> Result<PathBuf, Str
     if is_ndk_root(home) {
         if options.ndk_version.is_some() || options.ndk_index.is_some() {
             return Err(format!(
-                "Ndk_home '{}' already points to one NDK installation; remove -ndkversion/-nindx",
+                "{source} '{}' already points to one NDK installation; remove -ndkversion/-nindx",
                 home.display()
             ));
         }
         return Ok(home.into());
     }
     if !home.is_dir() {
-        return Err(format!("Ndk_home path does not exist: {}", home.display()));
+        return Err(format!("{source} path does not exist: {}", home.display()));
     }
 
     let candidates = fs::read_dir(home)
-        .map_err(|err| format!("cannot read Ndk_home directory '{}': {err}", home.display()))?
+        .map_err(|err| format!("cannot read {source} directory '{}': {err}", home.display()))?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.is_dir() && is_ndk_root(path))
         .collect::<Vec<_>>();
-    let available = candidates
+    let mut ordered_candidates = candidates.clone();
+    ordered_candidates.sort_by_key(|path| std::cmp::Reverse(ndk_version_key(path)));
+    let available = ordered_candidates
         .iter()
         .filter_map(|path| path.file_name()?.to_str())
         .collect::<Vec<_>>()
@@ -575,17 +720,17 @@ fn select_ndk_root(home: &Path, options: &AndroidOptions) -> Result<PathBuf, Str
     select_ndk_candidate(candidates, options).ok_or_else(|| {
         if let Some(version) = &options.ndk_version {
             format!(
-                "NDK version '{version}' was not found below Ndk_home '{}'; available versions: {available}",
+                "NDK version '{version}' was not found below {source} '{}'; available versions: {available}",
                 home.display()
             )
         } else if let Some(index) = options.ndk_index {
             format!(
-                "NDK index {index} is out of range below Ndk_home '{}'; newest-first versions: {available}",
+                "NDK index {index} is out of range below {source} '{}'; newest-first versions: {available}",
                 home.display()
             )
         } else {
             format!(
-                "Ndk_home '{}' is not an NDK and contains no NDK version with toolchains/llvm/prebuilt",
+                "{source} '{}' is not an NDK and contains no NDK version with toolchains/llvm/prebuilt",
                 home.display()
             )
         }
@@ -703,6 +848,16 @@ fn run_cargo(
     }
     command.env("CARGO_ZIRILD_ZIG_TARGET", &options.zig_target);
     command.env("CARGO_ZIRILD_OPTIMIZE", &options.optimize);
+    command.env(
+        "CARGO_ZIRILD_WINDOWS_RUNTIME",
+        options.windows_runtime.as_str(),
+    );
+    if options.force_native_optimize {
+        command.env("CARGO_ZIRILD_FORCE_NATIVE_OPTIMIZE", "1");
+    }
+    if options.trace {
+        command.env("CARGO_ZIRILD_TRACE", "1");
+    }
     if let Some(ndk) = android_ndk {
         command.env("CARGO_ZIRILD_ANDROID_SYSROOT", &ndk.sysroot);
         command.env(
@@ -831,6 +986,10 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
     let optimize = env::var_os("CARGO_ZIRILD_OPTIMIZE")
         .ok_or_else(|| "CARGO_ZIRILD_OPTIMIZE is missing from wrapper environment".to_owned())?;
     let compiler_optimize = compiler_optimization_flag(&optimize)?;
+    let force_native_optimize = env::var_os("CARGO_ZIRILD_FORCE_NATIVE_OPTIMIZE").is_some();
+    let windows_runtime = WindowsRuntimePolicy::parse(
+        &env::var("CARGO_ZIRILD_WINDOWS_RUNTIME").unwrap_or_else(|_| "auto".into()),
+    )?;
 
     let ndk_fallback = env::var_os("CARGO_ZIRILD_NDK_FALLBACK").is_some();
     let mut command = if ndk_fallback {
@@ -847,10 +1006,7 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
         }
         .ok_or_else(|| "NDK fallback tool path is missing from wrapper environment".to_owned())?;
         let mut command = Command::new(tool);
-        if matches!(
-            mode,
-            WrapperMode::Cc | WrapperMode::Cxx | WrapperMode::Linker
-        ) {
+        if mode == WrapperMode::Linker {
             command.arg(compiler_optimize);
         }
         command
@@ -860,18 +1016,10 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
         let mut command = Command::new(zig);
         match mode {
             WrapperMode::Cc => {
-                command
-                    .arg("cc")
-                    .arg("-target")
-                    .arg(&target)
-                    .arg(compiler_optimize);
+                command.arg("cc").arg("-target").arg(&target);
             }
             WrapperMode::Cxx => {
-                command
-                    .arg("c++")
-                    .arg("-target")
-                    .arg(&target)
-                    .arg(compiler_optimize);
+                command.arg("c++").arg("-target").arg(&target);
             }
             WrapperMode::Linker => {
                 command
@@ -913,14 +1061,20 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
             .to_string_lossy()
             .to_ascii_lowercase()
             .contains("-windows-");
-    // Rust's GNU Windows target supplies -nodefaultlibs and then expects a
-    // MinGW installation. Zig ships its own Windows CRT, which is intentionally
-    // disabled by that flag, so let Zig inject its bundled CRT instead.
-    let response_files = if windows_link {
-        filter_windows_runtime_response_files(&arguments)?
+    if windows_link
+        && windows_runtime == WindowsRuntimePolicy::Auto
+        && windows_runtime_may_be_custom(&arguments)
+    {
+        eprintln!(
+            "cargo-zirild: WARNING: custom Windows startup/runtime linker arguments were detected. The default Zig runtime rewrite remains active; use --windows-runtime=preserve to keep the original runtime arguments, or --windows-runtime=zig to acknowledge the rewrite explicitly."
+        );
+    }
+    let prepared_arguments = if windows_link {
+        prepare_windows_linker_arguments(arguments, windows_runtime)?
     } else {
-        Vec::new()
+        PreparedArguments::unchanged(arguments)
     };
+    let arguments = &prepared_arguments.arguments;
     let mut argument_index = 0;
     while argument_index < arguments.len() {
         let argument = &arguments[argument_index];
@@ -934,46 +1088,54 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
                 continue;
             }
         }
-        if mode == WrapperMode::Dlltool && argument == "--temp-prefix" {
-            argument_index += 2;
-            continue;
-        }
-        if mode == WrapperMode::Linker
-            && (argument == "-nodefaultlibs"
-                || (windows_link
-                    && (is_windows_runtime_argument(argument)
-                        || is_windows_auto_image_base_argument(argument))))
+        if force_native_optimize
+            && matches!(
+                mode,
+                WrapperMode::Cc | WrapperMode::Cxx | WrapperMode::Linker
+            )
+            && is_native_optimization_argument(argument)
         {
             argument_index += 1;
             continue;
         }
+        if mode == WrapperMode::Dlltool && argument == "--temp-prefix" {
+            argument_index += 2;
+            continue;
+        }
         if windows_link {
-            let transformed = transform_windows_linker_argument(argument);
             if env::var_os("CARGO_ZIRILD_TRACE").is_some()
-                && Path::new(&transformed)
+                && Path::new(argument)
                     .extension()
                     .is_some_and(|extension| extension.eq_ignore_ascii_case("def"))
             {
-                match fs::read_to_string(&transformed) {
+                match fs::read_to_string(argument) {
                     Ok(contents) => eprintln!(
                         "cargo-zirild trace: definition file {}:\n{}",
-                        Path::new(&transformed).display(),
+                        Path::new(argument).display(),
                         contents
                     ),
                     Err(err) => eprintln!(
                         "cargo-zirild trace: cannot read definition file {}: {err}",
-                        Path::new(&transformed).display()
+                        Path::new(argument).display()
                     ),
                 }
             }
-            command.arg(transformed);
+            command.arg(argument);
         } else {
             command.arg(argument);
         }
         argument_index += 1;
     }
-    if windows_link {
+    if windows_link && windows_runtime.rewrites_runtime() {
         command.arg("-lunwind");
+    }
+    if force_native_optimize
+        && matches!(
+            mode,
+            WrapperMode::Cc | WrapperMode::Cxx | WrapperMode::Linker
+        )
+    {
+        command.arg(compiler_optimize);
     }
 
     if env::var_os("CARGO_ZIRILD_TRACE").is_some() && mode != WrapperMode::Dlltool {
@@ -984,12 +1146,12 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
         );
     }
     let status = command.status();
-    restore_response_files(response_files);
-    let status = status.map_err(|err| format!("failed to start Zig: {err}"))?;
+    prepared_arguments.cleanup();
+    let tool = if ndk_fallback { "NDK LLVM" } else { "Zig" };
+    let status = status.map_err(|err| format!("failed to start {tool}: {err}"))?;
     if status.success() {
         Ok(())
     } else {
-        let tool = if ndk_fallback { "NDK LLVM" } else { "Zig" };
         Err(format!("{tool} {mode:?} failed with {status}"))
     }
 }
@@ -997,6 +1159,13 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
 fn is_embedded_target_argument(argument: &OsString) -> bool {
     let argument = argument.to_string_lossy();
     argument.starts_with("--target=") || argument.starts_with("-target=")
+}
+
+fn is_native_optimization_argument(argument: &OsString) -> bool {
+    matches!(
+        argument.to_string_lossy().as_ref(),
+        "-O" | "-O0" | "-O1" | "-O2" | "-O3" | "-Og" | "-Os" | "-Oz" | "-Ofast"
+    )
 }
 
 fn encode_wrapper_arguments(arguments: &[String]) -> String {
@@ -1042,6 +1211,27 @@ fn is_windows_auto_image_base_argument(argument: &OsString) -> bool {
     )
 }
 
+fn windows_runtime_may_be_custom(arguments: &[OsString]) -> bool {
+    arguments.iter().any(|argument| {
+        let text = argument.to_string_lossy();
+        if let Some(path) = text.strip_prefix('@') {
+            return fs::read_to_string(path).is_ok_and(|contents| {
+                contents
+                    .lines()
+                    .any(|line| is_custom_windows_runtime_argument(line.trim().trim_matches('"')))
+            });
+        }
+        is_custom_windows_runtime_argument(&text)
+    })
+}
+
+fn is_custom_windows_runtime_argument(argument: &str) -> bool {
+    matches!(argument, "-nostdlib" | "-nostartfiles" | "--entry" | "-e")
+        || argument.starts_with("--entry=")
+        || argument.starts_with("-Wl,--entry")
+        || argument.starts_with("-Wl,-e,")
+}
+
 fn transform_windows_linker_argument(argument: &OsString) -> OsString {
     let text = argument.to_string_lossy();
     if let Some(definition) = text.strip_prefix("-Wl,")
@@ -1054,76 +1244,184 @@ fn transform_windows_linker_argument(argument: &OsString) -> OsString {
     argument.clone()
 }
 
-/// rustc uses a response file for linker arguments on Windows. Zig provides
-/// these GNU runtime libraries internally, whereas Rust's GNU target expects a
-/// separate MinGW installation. Filter only those temporary response entries.
-fn filter_windows_runtime_response_files(
-    arguments: &[OsString],
-) -> Result<Vec<(PathBuf, String)>, String> {
-    let mut saved = Vec::new();
-    for argument in arguments {
-        let text = argument.to_string_lossy();
-        let Some(path) = text.strip_prefix('@') else {
-            continue;
-        };
-        let path = PathBuf::from(path);
-        let original = fs::read_to_string(&path).map_err(|err| {
-            format!(
-                "cannot read linker response file '{}': {err}",
-                path.display()
-            )
-        })?;
-        let lines: Vec<_> = original.lines().collect();
-        let library_directories = response_library_directories(&lines);
-        patch_empty_windows_definition_files(&lines, &mut saved)?;
-        let filtered = lines
-            .into_iter()
-            .filter_map(|line| transform_windows_response_line(line, &library_directories))
-            .collect::<Vec<_>>()
-            .join("\n");
-        if filtered != original {
-            fs::write(&path, format!("{filtered}\n")).map_err(|err| {
-                format!(
-                    "cannot update linker response file '{}': {err}",
-                    path.display()
-                )
-            })?;
-            saved.push((path, original));
-        }
-    }
-    Ok(saved)
+struct PreparedArguments {
+    arguments: Vec<OsString>,
+    temporary_directory: Option<PathBuf>,
 }
 
-fn patch_empty_windows_definition_files(
-    lines: &[&str],
-    saved: &mut Vec<(PathBuf, String)>,
-) -> Result<(), String> {
-    for line in lines {
-        let value = line.trim().trim_matches('"');
-        let Some(definition) = value.strip_prefix("-Wl,") else {
-            continue;
-        };
-        if !definition.to_ascii_lowercase().ends_with(".def") {
-            continue;
-        }
-        let path = PathBuf::from(definition);
-        let original = fs::read_to_string(&path).map_err(|err| {
-            format!(
-                "cannot read Windows definition file '{}': {err}",
-                path.display()
-            )
-        })?;
-        if let Some(patched) = windows_definition_with_fallback_export(&original) {
-            fs::write(&path, patched).map_err(|err| {
-                format!(
-                    "cannot update Windows definition file '{}': {err}",
-                    path.display()
-                )
-            })?;
-            saved.push((path, original));
+impl PreparedArguments {
+    fn unchanged(arguments: Vec<OsString>) -> Self {
+        Self {
+            arguments,
+            temporary_directory: None,
         }
     }
-    Ok(())
+
+    fn cleanup(&self) {
+        if let Some(directory) = &self.temporary_directory {
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
+}
+
+/// rustc uses response and module-definition files for Windows GNU links.
+/// Never rewrite those source files in place: create private copies beside the
+/// wrapper executable and pass the copies to Zig instead. A terminated wrapper
+/// may leave disposable files behind, but cannot corrupt rustc's link inputs.
+fn prepare_windows_linker_arguments(
+    arguments: Vec<OsString>,
+    runtime_policy: WindowsRuntimePolicy,
+) -> Result<PreparedArguments, String> {
+    let wrapper =
+        env::current_exe().map_err(|err| format!("cannot locate cargo-zirild wrapper: {err}"))?;
+    let parent = wrapper
+        .parent()
+        .ok_or_else(|| "cargo-zirild wrapper has no parent directory".to_owned())?;
+    let directory = parent.join(format!("link-{}", std::process::id()));
+    fs::create_dir_all(&directory).map_err(|err| {
+        format!(
+            "cannot create private linker directory '{}': {err}",
+            directory.display()
+        )
+    })?;
+
+    let mut prepared = Vec::with_capacity(arguments.len());
+    let mut file_index = 0usize;
+    for argument in arguments {
+        let text = argument.to_string_lossy();
+        if let Some(response_path) = text.strip_prefix('@') {
+            let response_path = PathBuf::from(response_path);
+            let rewritten = prepare_windows_response_file(
+                &response_path,
+                &directory,
+                &mut file_index,
+                runtime_policy,
+            )?;
+            prepared.push(format!("@{}", rewritten.display()).into());
+            continue;
+        }
+        if runtime_policy.rewrites_runtime()
+            && (is_windows_runtime_argument(&argument)
+                || is_windows_auto_image_base_argument(&argument))
+        {
+            continue;
+        }
+        let transformed = transform_windows_linker_argument(&argument);
+        prepared.push(prepare_definition_argument(
+            transformed,
+            &directory,
+            &mut file_index,
+        )?);
+    }
+
+    Ok(PreparedArguments {
+        arguments: prepared,
+        temporary_directory: Some(directory),
+    })
+}
+
+fn prepare_windows_response_file(
+    source: &Path,
+    directory: &Path,
+    file_index: &mut usize,
+    runtime_policy: WindowsRuntimePolicy,
+) -> Result<PathBuf, String> {
+    let original = fs::read_to_string(source).map_err(|err| {
+        format!(
+            "cannot read linker response file '{}': {err}",
+            source.display()
+        )
+    })?;
+    let lines: Vec<_> = original.lines().collect();
+    let library_directories = response_library_directories(&lines);
+    let mut rewritten = Vec::with_capacity(lines.len());
+    for line in lines {
+        if let Some(line) = prepare_windows_response_line(
+            line,
+            &library_directories,
+            directory,
+            file_index,
+            runtime_policy,
+        )? {
+            rewritten.push(line);
+        }
+    }
+    let output = directory.join(format!("response-{}.rsp", *file_index));
+    *file_index += 1;
+    fs::write(&output, format!("{}\n", rewritten.join("\n"))).map_err(|err| {
+        format!(
+            "cannot write private linker response file '{}': {err}",
+            output.display()
+        )
+    })?;
+    Ok(output)
+}
+
+fn prepare_windows_response_line(
+    line: &str,
+    library_directories: &[PathBuf],
+    directory: &Path,
+    file_index: &mut usize,
+    runtime_policy: WindowsRuntimePolicy,
+) -> Result<Option<String>, String> {
+    let trimmed = line.trim();
+    let quoted = trimmed.starts_with('"') && trimmed.ends_with('"');
+    let value = trimmed.trim_matches('"');
+    let argument = OsString::from(value);
+    if runtime_policy.rewrites_runtime()
+        && (is_windows_runtime_argument(&argument)
+            || is_windows_auto_image_base_argument(&argument))
+    {
+        return Ok(None);
+    }
+
+    if let Some(name) = value.strip_prefix("-l")
+        && let Some(library) = find_windows_import_library(name, library_directories)
+    {
+        return Ok(Some(format!("\"{}\"", library.display())));
+    }
+
+    let transformed = transform_windows_linker_argument(&argument);
+    let transformed = prepare_definition_argument(transformed, directory, file_index)?;
+    if transformed == value {
+        Ok(Some(line.into()))
+    } else if quoted {
+        Ok(Some(format!("\"{}\"", transformed.to_string_lossy())))
+    } else {
+        Ok(Some(transformed.to_string_lossy().into_owned()))
+    }
+}
+
+fn prepare_definition_argument(
+    argument: OsString,
+    directory: &Path,
+    file_index: &mut usize,
+) -> Result<OsString, String> {
+    let path = PathBuf::from(&argument);
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("def"))
+    {
+        return Ok(argument);
+    }
+    let original = fs::read_to_string(&path).map_err(|err| {
+        format!(
+            "cannot read Windows definition file '{}': {err}",
+            path.display()
+        )
+    })?;
+    let Some(patched) = windows_definition_with_fallback_export(&original) else {
+        return Ok(argument);
+    };
+    let output = directory.join(format!("definition-{}.def", *file_index));
+    *file_index += 1;
+    fs::write(&output, patched).map_err(|err| {
+        format!(
+            "cannot write private Windows definition file '{}': {err}",
+            output.display()
+        )
+    })?;
+    Ok(output.into_os_string())
 }
 
 fn windows_definition_with_fallback_export(contents: &str) -> Option<String> {
@@ -1161,31 +1459,6 @@ fn response_library_directories(lines: &[&str]) -> Vec<PathBuf> {
     directories
 }
 
-fn transform_windows_response_line(line: &str, library_directories: &[PathBuf]) -> Option<String> {
-    let trimmed = line.trim();
-    let quoted = trimmed.starts_with('"') && trimmed.ends_with('"');
-    let value = trimmed.trim_matches('"');
-    let argument = OsString::from(value);
-    if is_windows_runtime_argument(&argument) || is_windows_auto_image_base_argument(&argument) {
-        return None;
-    }
-
-    if let Some(name) = value.strip_prefix("-l")
-        && let Some(library) = find_windows_import_library(name, library_directories)
-    {
-        return Some(format!("\"{}\"", library.display()));
-    }
-
-    let transformed = transform_windows_linker_argument(&OsString::from(value));
-    if transformed == value {
-        Some(line.into())
-    } else if quoted {
-        Some(format!("\"{}\"", transformed.to_string_lossy()))
-    } else {
-        Some(transformed.to_string_lossy().into_owned())
-    }
-}
-
 fn find_windows_import_library(name: &str, directories: &[PathBuf]) -> Option<PathBuf> {
     let candidates = [
         format!("lib{name}.a"),
@@ -1201,12 +1474,6 @@ fn find_windows_import_library(name: &str, directories: &[PathBuf]) -> Option<Pa
         }
     }
     None
-}
-
-fn restore_response_files(response_files: Vec<(PathBuf, String)>) {
-    for (path, original) in response_files {
-        let _ = fs::write(path, original);
-    }
 }
 
 /// Zig's C/C++ frontend accepts Clang optimization flags, not Zig Build's
@@ -1294,10 +1561,16 @@ mod tests {
         let dev = parse_args(vec!["-target=x86_64-linux-musl".into()]).unwrap();
         let release =
             parse_args(vec!["-target=x86_64-linux-musl".into(), "--release".into()]).unwrap();
-        let small = parse_args(vec!["-target=x86_64-linux-musl".into(), "-Z".into()]).unwrap();
+        let small = parse_args(vec![
+            "-target=x86_64-linux-musl".into(),
+            "--zig-release-small".into(),
+        ])
+        .unwrap();
         assert_eq!(dev.optimize, "ReleaseSafe");
         assert_eq!(release.optimize, "ReleaseFast");
         assert_eq!(small.optimize, "ReleaseSmall");
+        assert!(!dev.force_native_optimize);
+        assert!(small.force_native_optimize);
     }
 
     #[test]
@@ -1305,10 +1578,11 @@ mod tests {
         let options = parse_args(vec![
             "-target=x86_64-linux-musl".into(),
             "--release".into(),
-            "-ZigOptimize=Debug".into(),
+            "--zig-opt=small".into(),
         ])
         .unwrap();
-        assert_eq!(options.optimize, "Debug");
+        assert_eq!(options.optimize, "ReleaseSmall");
+        assert!(options.force_native_optimize);
     }
 
     #[test]
@@ -1357,6 +1631,8 @@ mod tests {
             "-target=aarch64-linux-android"
         )));
         assert!(!is_embedded_target_argument(&OsString::from("-m64")));
+        assert!(is_native_optimization_argument(&OsString::from("-O3")));
+        assert!(!is_native_optimization_argument(&OsString::from("-g")));
     }
 
     #[test]
@@ -1374,6 +1650,28 @@ mod tests {
     }
 
     #[test]
+    fn validates_windows_runtime_policy_scope_and_custom_runtime_signals() {
+        let options = parse_args(vec![
+            "-target=x86_64-pc-windows-gnu".into(),
+            "--windows-runtime=preserve".into(),
+        ])
+        .unwrap();
+        assert_eq!(options.windows_runtime, WindowsRuntimePolicy::Preserve);
+        assert!(
+            parse_args(vec![
+                "-target=x86_64-linux-gnu".into(),
+                "--windows-runtime=preserve".into(),
+            ])
+            .is_err()
+        );
+        assert!(is_custom_windows_runtime_argument("-nostartfiles"));
+        assert!(is_custom_windows_runtime_argument(
+            "-Wl,--entry=custom_start"
+        ));
+        assert!(!is_custom_windows_runtime_argument("-nodefaultlibs"));
+    }
+
+    #[test]
     fn zigpatch_overrides_are_parsed() {
         let options = parse_args(vec![
             "-target=x86_64-linux-musl".into(),
@@ -1383,6 +1681,17 @@ mod tests {
         assert_eq!(
             options.zig_patch,
             Some(PathBuf::from("C:\\tools\\zig\\zig.exe"))
+        );
+        let canonical = parse_args(vec![
+            "-target=x86_64-linux-android".into(),
+            "--zig-path=C:\\tools\\zig".into(),
+            "--ndk-path=C:\\Android\\Sdk\\ndk".into(),
+        ])
+        .unwrap();
+        assert_eq!(canonical.zig_patch, Some(PathBuf::from("C:\\tools\\zig")));
+        assert_eq!(
+            canonical.android.ndk_path,
+            Some(PathBuf::from("C:\\Android\\Sdk\\ndk"))
         );
     }
 
@@ -1427,6 +1736,15 @@ mod tests {
                 OsString::from("run")
             ]
         );
+        assert!(!requests_driver_help(&[
+            OsString::from("-target=x86_64-pc-windows-msvc"),
+            OsString::from("run"),
+            OsString::from("--help")
+        ]));
+        assert!(requests_driver_help(&[
+            OsString::from("-target=x86_64-pc-windows-msvc"),
+            OsString::from("--help")
+        ]));
     }
 
     #[test]
@@ -1445,6 +1763,27 @@ mod tests {
     }
 
     #[test]
+    fn preserves_cargo_nightly_z_option_and_stops_command_guessing() {
+        let options = parse_args(vec![
+            "-target=x86_64-linux-musl".into(),
+            "-Z".into(),
+            "unstable-options".into(),
+            "run".into(),
+        ])
+        .unwrap();
+        assert_eq!(options.cargo_command, "build");
+        assert_eq!(
+            options.cargo_args,
+            vec![
+                OsString::from("-Z"),
+                OsString::from("unstable-options"),
+                OsString::from("run")
+            ]
+        );
+        assert_eq!(options.optimize, "ReleaseSafe");
+    }
+
+    #[test]
     fn converts_windows_definition_file_for_zig_linker() {
         let argument = OsString::from("-Wl,D:\\build\\exports.def");
         assert_eq!(
@@ -1454,19 +1793,43 @@ mod tests {
     }
 
     #[test]
-    fn converts_definition_files_inside_linker_response_files() {
+    fn rewrites_private_linker_inputs_without_mutating_sources() {
+        let root =
+            env::temp_dir().join(format!("cargo-zirild-response-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let private = root.join("private");
+        fs::create_dir_all(&private).unwrap();
+        let definition = root.join("exports.def");
+        let response = root.join("link.rsp");
+        fs::write(&definition, "EXPORTS\n").unwrap();
+        fs::write(
+            &response,
+            format!("\"-nodefaultlibs\"\n\"-Wl,{}\"\n", definition.display()),
+        )
+        .unwrap();
+
+        let mut index = 0;
+        let rewritten = prepare_windows_response_file(
+            &response,
+            &private,
+            &mut index,
+            WindowsRuntimePolicy::Auto,
+        )
+        .unwrap();
+        let rewritten = fs::read_to_string(rewritten).unwrap();
+
         assert_eq!(
-            transform_windows_response_line("\"-Wl,D:\\build\\exports.def\"", &[]),
-            Some("\"D:\\build\\exports.def\"".into())
+            fs::read_to_string(&response).unwrap(),
+            format!("\"-nodefaultlibs\"\n\"-Wl,{}\"\n", definition.display())
         );
+        assert_eq!(fs::read_to_string(&definition).unwrap(), "EXPORTS\n");
+        assert!(!rewritten.contains("-nodefaultlibs"));
+        assert!(rewritten.contains("definition-0.def"));
         assert_eq!(
-            transform_windows_response_line("\"-nodefaultlibs\"", &[]),
-            None
+            fs::read_to_string(private.join("definition-0.def")).unwrap(),
+            "EXPORTS\n    DllMainCRTStartup\n"
         );
-        assert_eq!(
-            transform_windows_response_line("\"-Wl,--disable-auto-image-base\"", &[]),
-            None
-        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

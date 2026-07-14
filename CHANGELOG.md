@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Stop reserving Cargo's `-Z` option; add `--zig-release-small` and the canonical
+  `--zig-opt=<mode>` replacement for Zirild optimization selection.
+- Stop guessing Cargo commands after Cargo argument parsing begins, preventing
+  future option values such as `run` from being reinterpreted as commands.
+- Rewrite Windows GNU response and empty module-definition files through
+  private copies instead of modifying rustc-generated inputs in place.
+- Add `--windows-runtime=auto|zig|preserve`, a preservation alias, and warnings
+  for detected custom Windows startup/runtime arguments.
+- Respect Cargo build-helper C/C++ optimization flags by default; only explicit
+  Zirild optimization selection removes conflicting native `-O*` flags and
+  appends the selected policy last.
+- Add standard Zig and Android NDK environment lookup, `PATH` fallback,
+  `--zig-path`, `--ndk-path`, and a public `--trace` option while retaining the
+  legacy mixed-case environment variables and CLI spellings.
+- Report NDK LLVM, rather than Zig, when an Android fallback tool cannot start.
 - Ignore duplicate `--target` arguments injected by native build helpers such
   as `cc-rs`, preserving Zirild's Zig-compatible target mapping for C and C++.
 - Disable Zig's implicit C/C++ undefined-behavior sanitizer instrumentation by

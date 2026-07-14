@@ -3,208 +3,206 @@
 [GitHub repository](https://github.com/Booklight12/zirild)
 
 `cargo-zirild` is a Cargo subcommand for building, checking, testing, and
-running the current Rust project for a selected target. It configures temporary
-Zig tool wrappers automatically; callers do not need to create
-`.cargo/config.toml` or set `CC`, `CXX`, linker, `AR`, or `dlltool` variables.
+running Rust projects for a selected target. It creates temporary tool wrappers
+for Rust linking and native C/C++ dependencies, so projects do not need a
+custom `.cargo/config.toml` or manually configured `CC`, `CXX`, linker, `AR`,
+or `dlltool` variables. The executable has no third-party Rust dependencies.
 
-Rust source is still compiled by `rustc`. For GNU-family targets, Rust linking
-uses `zig cc`, while `cc` crate build scripts use `zig cc`, `zig c++`, and
-`zig ar` for C, C++, and archives. Windows GNU raw-dylib import libraries use
-`zig dlltool`. MSVC targets retain the system MSVC compiler, linker, and
-librarian because their build scripts require that ABI-compatible tool family.
+The long-term goal is one cross-platform final-link path driven by Zig. Rust
+source is still compiled by `rustc`; Zirild controls the native compiler,
+archiver, and linker selected around Cargo.
 
-## Installation
+## Toolchain policy
+
+| Target or mode | C/C++ and archives | Final linker | Current status |
+| --- | --- | --- | --- |
+| GNU-family targets | `zig cc`, `zig c++`, `zig ar` | Zig | primary path |
+| Windows GNU raw-dylib | Zig tools and `zig dlltool` | Zig | supported |
+| Windows MSVC | system MSVC tools | system MSVC linker | compatibility exception |
+| Android, default mode | Zig tools | Zig | `check` works; Android libc linking is currently unavailable in Zig |
+| Android with `-ndkfallback` | NDK Clang and LLVM ar | NDK LLD | explicit fallback; not Zig-linked |
+
+Zirild never switches an Android build to NDK Clang/LLD silently. The fallback
+requires `-ndkfallback` and emits a prominent build warning.
+
+## Install
 
 ```powershell
 cargo install cargo-zirild
 ```
 
-## Prerequisites
-
-Set `Zig_home` to the Zig installation directory or the full `zig`/`zig.exe`
-path. Use `-zigpatch=<path>` to override `Zig_home` for one command. Zirild
-accepts either a Zig directory or executable and verifies it with `zig version`
-before Cargo starts.
-
-The selected Rust target must be installed in the active Rust toolchain because
-Cargo and `rustc` provide the Rust standard library for that target.
-
-For Android target discovery, set `Ndk_home` to an NDK installation or to the
-Android SDK `ndk` directory. When it points to an SDK directory containing
-multiple versions, Zirild selects the newest valid NDK installation (for
-example, it selects `30.0.14904198` over `27.2.12479018`). Use
-`-ndkversion=<version>` to select an exact existing version, or
-`-nindx=<index>` to select from the newest-first ordered list (`0` is newest,
-`1` is the next oldest). Zirild prints the selected version and full path for
-every Android Cargo invocation.
-
-Zirild's contract is that Zig remains the C/C++ compiler and final linker for
-every non-MSVC target. The current Zig distribution cannot link Android libc,
-even when an NDK sysroot exists, so Zirild deliberately does not substitute
-NDK clang for its final link. Android `check` can succeed; Android native
-`build` currently cannot produce an NDK-linked file through Zig. Zirild reports
-the discovered NDK and the constraint rather than silently producing a file
-with a different linker. It suggests the corresponding musl target as a
-compatibility alternative; that alternative produces a self-contained musl
-Linux binary, not an Android-NDK-linked application.
-
-If producing an Android file is more important than retaining the Zig-linker
-contract, pass `-ndkfallback`. This is
-an explicit opt-in to the selected NDK's Clang/LLD and LLVM ar. Zirild prints a
-warning before the Cargo command because the final file is then **not** linked
-by Zig.
+Set `ZIG_HOME` to the Zig installation directory or directly to `zig`/`zig.exe`:
 
 ```powershell
-$env:Zig_home = 'C:\tools\zig'
+$env:ZIG_HOME = 'C:\tools\zig'
+```
+
+Zig lookup order is:
+
+1. `--zig-path=<path>`;
+2. `CARGO_ZIRILD_ZIG_PATH`, `ZIG`, `ZIG_HOME`, then legacy `Zig_home`;
+3. `zig` from `PATH`.
+
+The legacy `-zigpatch=<path>` spelling remains accepted. Zirild validates the
+selected executable with `zig version` before Cargo starts.
+
+The selected Rust target must also be installed in the active Rust toolchain:
+
+```powershell
 rustup target add x86_64-pc-windows-gnu
 ```
 
-## Cargo commands
+## Quick start
 
 ```powershell
-# Zig target x86_64-windows-gnu maps to Cargo x86_64-pc-windows-gnu.
+# build is the default Cargo command
 cargo zirild -target=x86_64-windows-gnu
 
-# Short Windows target selects x86_64-pc-windows-msvc.
-cargo zirild -target=x86_64-pc-windows
+# Build a Linux GNU target using an explicit Zig executable.
+cargo zirild -target=x86_64-unknown-linux-gnu --zig-path=D:\tools\zig\zig.exe
 
-cargo zirild -target=x86_64-unknown-linux-gnu -zigpatch=D:\tools\zig\zig.exe
-
-# Cargo release profile and Zig ReleaseFast native/link optimization.
-cargo zirild -target=aarch64-linux-musl --release
-
-# Zig ReleaseSmall.
-cargo zirild -target=aarch64-linux-musl -Z
-
-# Override only Zig's optimization mode.
-cargo zirild -target=x86_64-linux-gnu -ZigOptimize=ReleaseSafe --features tls
-```
-
-## Android NDK options
-
-Android settings are consumed by Zirild rather than forwarded as invalid Cargo
-arguments. The selected NDK root/sysroot are exported to build scripts, while
-explicit native flags are given to the Zig compiler/linker wrappers; Zig remains
-the final linker.
-
-```powershell
-# Default: select the newest valid NDK under $env:Ndk_home.
-cargo zirild -target=x86_64-linux-android check
-
-# Select a particular installed NDK version. Quote dotted versions in PowerShell.
-cargo zirild -target=x86_64-linux-android -ndkversion='27.2.12479018' check
-
-# Newest-first index: 0 is newest, 1 is the next oldest.
-cargo zirild -target=x86_64-linux-android -nindx=1 check
-
-# Android API and ABI; CMake-style ANDROID_* forms are accepted as aliases.
-cargo zirild -target=x86_64-linux-android -android-api=24 -android-abi=x86_64 check
-cargo zirild -target=x86_64-linux-android -DANDROID_PLATFORM=android-24 -DANDROID_ABI=x86_64 check
-
-# Pass native flags only to Zig's C/C++ or final-linker invocation.
-cargo zirild -target=x86_64-linux-android -android-cflag=-fPIC -android-link-arg=-Wl,--build-id check
-
-# Explicitly fall back to the selected NDK Clang/LLD to produce an Android file.
-# The final linker is not Zig; Zirild prints a warning.
-cargo zirild -target=x86_64-linux-android -ndkfallback build
-```
-
-Supported Android-specific options are `-ndkversion`, `-nindx`,
-`-android-api`, `-android-abi`, `-android-stl`, `-android-cflag`, and
-`-android-link-arg`. Zirild also parses CMake-style `-DANDROID_ABI=...`,
-`-DANDROID_PLATFORM=android-<api>`, and `-DANDROID_STL=...`; they become
-`ANDROID_ABI`, `ANDROID_PLATFORM`, and `ANDROID_STL` environment values for
-Cargo build scripts. It also exports the selected NDK as `ANDROID_NDK_ROOT` and
-`CMAKE_ANDROID_NDK`. `-ndkfallback` is Android-only and intentionally switches
-the C compiler, C++ compiler, linker, and archiver to NDK Clang/LLD and LLVM ar.
-
-## Current target validation
-
-The following matrix was compiled on Windows against the locally installed Rust
-targets on 2026-07-14 using a temporary standalone validation crate outside the
-published package. This validates compilation and linker output, not execution
-on a device or foreign operating system.
-
-| Rust target | Zirild invocation | Native linker | Result |
-| --- | --- | --- | --- |
-| `aarch64-linux-android` | `-ndkfallback build` | NDK 30.0.14904198 Clang/LLD | passed; ELF64 AArch64 PIE |
-| `x86_64-linux-android` | `-ndkfallback build` | NDK 30.0.14904198 Clang/LLD | passed; ELF64 x86-64 PIE |
-| `x86_64-pc-windows-gnu` | `build` | Zig LLD | passed |
-| `x86_64-pc-windows-msvc` | `build` | system MSVC | passed |
-| `x86_64-unknown-linux-gnu` | `build` | Zig LLD | passed |
-
-The Android artifacts were inspected with the selected NDK's `llvm-readelf`.
-For Windows GNU, Zirild filters Rust's `--enable/--disable-auto-image-base`
-switches because Zig LLD reports them as unimplemented and ignores them; this
-removes the warning without changing Zig's image-base behavior.
-
-### Mixed Rust/C/C++ Linux execution
-
-A temporary external validation crate used a `build.rs` with `cc-rs`, one C
-translation unit, one C++17 translation unit, and Rust `extern "C"` calls. The
-fixture is intentionally not included in the published crate. Its build trace
-confirmed that Zirild invoked Zig in `Cc`, `Cxx`, `Ar`, and final `Linker` modes
-for `x86_64-unknown-linux-gnu`.
-
-```powershell
-cargo zirild -target=x86_64-unknown-linux-gnu build
-wsl -d Ubuntu -- /mnt/d/path/to/project/target/x86_64-unknown-linux-gnu/debug/app
-```
-
-The resulting file was an x86-64 PIE ELF dynamically linked against the Ubuntu
-WSL2 glibc environment. Its runtime output was:
-
-```text
-Rust -> C: 42; Rust -> C++: 42
-```
-
-This test exposed two native-wrapper issues that are fixed in the current
-source: `cc-rs` target overrides are filtered so they cannot replace Zirild's
-Zig target, and implicit Zig UBSan instrumentation is disabled unless the
-caller explicitly requests sanitizer flags.
-
-### Mixed Rust/C/C++ Windows execution
-
-The same native sources were built and run on the Windows host through both
-installed Windows targets:
-
-| Rust target | C/C++ and linker backend | Trace evidence | Runtime result |
-| --- | --- | --- | --- |
-| `x86_64-pc-windows-gnu` | Zig `cc`, `c++`, `ar`, and LLD | `Cc`, `Cxx`, `Ar`, and `Linker` wrapper modes invoked | passed |
-| `x86_64-pc-windows-msvc` | system Microsoft C/C++ compiler, librarian, and linker | MSVC 19.51 x64 compiler detected by `cc-rs` | passed |
-
-Both PE executables completed with exit code 0 and printed:
-
-```text
-Rust -> C: 42; Rust -> C++: 42
-```
-
-The final non-tracing builds completed without compiler or linker warnings.
-
-`build` is the default Cargo command. You can also select `check`, `run`,
-`test`, `bench`, `rustc`, `clippy`, or `doc`. The command may follow the Zirild
-options, so a native Windows MSVC binary can be built and started with:
-
-```powershell
+# Build and run a native Windows MSVC target.
 cargo zirild -target=x86_64-pc-windows-msvc run
-```
 
-Arguments after `--` are preserved for commands that execute a binary:
-
-```powershell
+# Pass arguments to the produced executable.
 cargo zirild -target=x86_64-pc-windows-msvc run -- --example-argument
 ```
 
-Cross-compiled executables can only be run when the host OS can execute the
-selected target. Use the default `build` or `check` command for other targets.
+Both Zig target names and recognized Rust target triples are accepted. For
+example, `x86_64-windows-gnu` maps to `x86_64-pc-windows-gnu`, while the short
+`x86_64-pc-windows` form selects `x86_64-pc-windows-msvc`.
 
-Commands that produce artifacts use Cargo's normal paths:
-`target/<cargo-target>/debug/` by default, or
-`target/<cargo-target>/release/` with `--release`.
+Do not pass Cargo's `--target`; Zirild's `-target` is the single source of truth
+and is converted to the corresponding Rust target triple.
 
-## Linux GNU
+## Command reference
 
-Both Zig and Rust target spellings are accepted:
+```text
+cargo zirild -target=<zig-target> [zirild options] [cargo command] [cargo options]
+```
+
+Supported Cargo commands are `build` (default), `check`, `run`, `test`,
+`bench`, `rustc`, `clippy`, and `doc`. Other arguments, including `--package`,
+`--bin`, `--features`, `--locked`, and arguments after `--`, are passed to the
+selected Cargo command.
+
+When selecting a command explicitly, place it before its Cargo options:
+
+```powershell
+cargo zirild -target=x86_64-pc-windows-msvc run --release -- --example-argument
+```
+
+After the command, Zirild no longer guesses whether an argument value such as
+`run` is another command. If the command is omitted, the first non-Zirild
+argument starts the default `build` arguments. Cargo's `-Z <feature>` is passed
+through unchanged; Zirild does not reserve `-Z`.
+
+### General options
+
+| Option | Meaning |
+| --- | --- |
+| `-target=<target>` | required Zig target or recognized Rust target triple |
+| `--zig-path=<path>` | select a Zig directory or executable for this invocation |
+| `--release` | Cargo release profile and Zig `ReleaseFast` |
+| `--zig-release-small` | select Zig `ReleaseSmall` and force native `-Oz` |
+| `--zig-opt=<mode>` | select `debug`, `safe`, `fast`, `small`, or a full Zig mode name |
+| `--windows-runtime=<policy>` | Windows GNU runtime policy: `auto`, `zig`, or `preserve` |
+| `--preserve-linker-args` | alias for `--windows-runtime=preserve` |
+| `--trace` | print native wrapper invocation details |
+| `-h`, `--help` | show command help |
+
+The legacy `-zigpatch=<path>` and `-ZigOptimize=<mode>` spellings remain
+accepted for compatibility.
+
+The default link policy is Zig `ReleaseSafe`; Cargo `--release` maps the link
+policy to `ReleaseFast`. Native C/C++ compilation normally keeps the
+optimization flags selected by `cc-rs`, CMake, or another build helper from
+Cargo's profile environment. An explicit `--zig-opt` or
+`--zig-release-small` removes conflicting native `-O*` arguments and appends
+the selected `-O0`, `-O2`, `-O3`, or `-Oz` flag last. Rust crates always retain
+Cargo's normal profile semantics.
+
+## Android NDK
+
+Set `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, or legacy `Ndk_home` to either:
+
+- one NDK installation; or
+- the Android SDK `ndk` directory containing version subdirectories.
+
+When multiple valid NDK versions exist, Zirild selects the newest version. It
+prints the selected version and full path in every Android build log.
+
+```powershell
+$env:ANDROID_NDK_HOME = 'D:\Android\Sdk\ndk'
+
+# Use the newest installed NDK.
+cargo zirild -target=x86_64-linux-android check
+
+# Select an exact installed version.
+cargo zirild -target=x86_64-linux-android -ndkversion='27.2.12479018' check
+
+# Select by newest-first index: 0 is newest, 1 is the next oldest.
+cargo zirild -target=x86_64-linux-android -nindx=1 check
+```
+
+### Android options
+
+| Option | Meaning |
+| --- | --- |
+| `--ndk-path=<path>` | select one NDK or an SDK `ndk` directory for this invocation |
+| `-ndkversion=<version>` | select an exact version below the NDK search directory |
+| `-nindx=<index>` | select from the newest-first version list |
+| `-android-api=<level>` | select the Android API level |
+| `-android-abi=<abi>` | validate the ABI, such as `arm64-v8a` or `x86_64` |
+| `-android-stl=<name>` | export the requested NDK STL setting |
+| `-android-cflag=<flag>` | pass one flag to the selected native compiler |
+| `-android-link-arg=<flag>` | pass one flag to the selected native linker |
+| `-ndkfallback` | explicitly use NDK Clang/LLD and LLVM ar instead of Zig |
+
+CMake-style `-DANDROID_ABI=...`,
+`-DANDROID_PLATFORM=android-<api>`, and `-DANDROID_STL=...` aliases are also
+parsed in Android mode. Zirild exports their values for Cargo build scripts,
+along with `ANDROID_NDK_ROOT` and `CMAKE_ANDROID_NDK`.
+
+NDK lookup order is `--ndk-path`, `CARGO_ZIRILD_NDK_PATH`,
+`ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, legacy `Ndk_home`, then the `ndk`
+directory below `ANDROID_SDK_ROOT` or `ANDROID_HOME`.
+
+Example native configuration:
+
+```powershell
+cargo zirild -target=x86_64-linux-android `
+  -android-api=24 `
+  -android-abi=x86_64 `
+  -android-cflag=-fPIC `
+  -android-link-arg=-Wl,--build-id `
+  check
+```
+
+### Android fallback
+
+The current Zig distribution cannot link Android libc even when an NDK sysroot
+is available. Default Android mode therefore preserves the Zig-linker contract
+and reports the limitation instead of silently producing a file with another
+linker.
+
+To produce an Android file with the installed NDK, opt in explicitly:
+
+```powershell
+cargo zirild -target=x86_64-linux-android -ndkfallback build
+```
+
+This switches C, C++, archive, and final-link steps to NDK Clang/LLD and LLVM
+ar. The build log warns that the final output is not linked by Zig.
+
+A suggested musl target is only a compatibility alternative: it produces a
+self-contained Linux binary, not an Android application.
+
+## Platform notes
+
+### Linux GNU
+
+Both target spellings below select the same Cargo target:
 
 ```powershell
 rustup target add x86_64-unknown-linux-gnu
@@ -213,35 +211,82 @@ cargo zirild -target=x86_64-unknown-linux-gnu
 ```
 
 Zig supplies the GNU libc toolchain for ordinary Rust and native C/C++
-dependencies. Applications that link Linux desktop libraries outside libc,
-such as DBus, GTK, X11, or WebKit2GTK, additionally require a target Linux
-sysroot containing those libraries and their pkg-config metadata. Zig does not
-bundle application-level Linux desktop libraries.
+dependencies. Applications using desktop libraries outside libc, such as DBus,
+GTK, X11, or WebKit2GTK, additionally need a target sysroot containing those
+libraries and their pkg-config metadata.
 
-## Zig optimization mapping
+### Windows
 
-| Command form | Zig mode |
-| --- | --- |
-| default (Cargo dev) | `ReleaseSafe` |
-| `--release` | `ReleaseFast` |
-| `-Z` | `ReleaseSmall` |
-| `-ZigOptimize=<mode>` | explicit `Debug`, `ReleaseSafe`, `ReleaseFast`, or `ReleaseSmall` |
+Windows GNU uses Zig for C, C++, archives, raw-dylib import libraries, and final
+linking. Zirild removes Rust's ignored `--enable/--disable-auto-image-base`
+switches before Zig LLD is invoked. Linker response files are rewritten into a
+private wrapper directory, and empty module-definition files are copied there
+before a fallback export is added. Zirild never edits rustc's original `.rsp`
+or `.def` inputs in place.
 
-All other arguments are passed through to the selected Cargo command,
-including `--package`, `--bin`, `--features`, `--locked`, and arguments after
-`--`.
+The default `--windows-runtime=auto` policy replaces the known Rust MinGW
+runtime arguments with Zig's bundled runtime and adds `-lunwind`. It warns when
+custom startup or entry-point arguments are detected. Use `zig` to acknowledge
+and force that policy, or `preserve` for `no_std`, a custom CRT, custom startup
+objects, or manually controlled unwind libraries. `preserve` disables runtime
+argument removal and the automatic `-lunwind` addition.
 
-For C/C++ compilation and Zig linking, these policies are translated to the
-frontend flags `-O0`, `-O2`, `-O3`, and `-Oz`, respectively. Rust crates
-themselves keep Cargo's normal dev/release profile semantics.
+Windows MSVC currently retains the system compiler, librarian, and linker for
+ABI compatibility. It is a documented exception to the unified Zig-linker
+goal.
 
-When an Android target is requested, `cargo-zirild` looks for `Ndk_home`,
-reports the selected NDK during the actual Cargo invocation, exports its root
-and sysroot for build scripts, forwards Android-only native flags to Zig, and
-retains Zig as the final linker. It also explains the current Android libc
-linkage constraint. The musl suggestion is an explicit compatibility
-alternative, not an Android target. With explicit `-ndkfallback`, Zirild instead
-uses NDK Clang/LLD and clearly warns that the final linker is no longer Zig.
+## Validation
+
+The current source was validated on 2026-07-14 with a temporary standalone
+fixture outside the published package.
+
+| Rust target | Mode and linker | Result |
+| --- | --- | --- |
+| `aarch64-linux-android` | `-ndkfallback`, NDK 30.0.14904198 Clang/LLD | passed; ELF64 AArch64 PIE |
+| `x86_64-linux-android` | `-ndkfallback`, NDK 30.0.14904198 Clang/LLD | passed; ELF64 x86-64 PIE |
+| `x86_64-unknown-linux-gnu` | Zig | passed; mixed Rust/C/C++ ELF ran in Ubuntu WSL2 |
+| `x86_64-pc-windows-gnu` | Zig | passed; mixed Rust/C/C++ PE ran on Windows |
+| `x86_64-pc-windows-msvc` | system MSVC | passed; mixed Rust/C/C++ PE ran on Windows |
+
+The native fixture used `cc-rs`, one C translation unit, one C++17 translation
+unit, and Rust `extern "C"` calls. Build traces confirmed the expected C, C++,
+archive, and final-link wrapper modes. All three runnable binaries completed
+with exit code 0 and produced the expected interop results.
+
+Android artifacts were inspected with the selected NDK's `llvm-readelf`.
+Android device execution has not yet been validated.
+
+The latest reliability pass also verified that Windows linker source files
+remain unchanged, temporary wrapper files are removed after a successful
+build, Cargo nightly `-Z` arguments remain intact, and Android NDK discovery
+works through `ANDROID_NDK_HOME`.
+
+## Scope and current limits
+
+Zirild is currently strongest as a Windows-hosted, native-dependency-aware
+Cargo driver for Windows GNU and Linux targets. It is not yet a universal SDK
+or build-system replacement.
+
+- Windows MSVC is orchestrated by Zirild but compiled and linked by MSVC.
+- Strict Zig Android mode can check code but cannot currently link Android libc;
+  `-ndkfallback` is explicit NDK LLVM orchestration.
+- Android device execution is not yet covered by the validation matrix.
+- Minimum-glibc suffixes, Apple universal binaries, custom target JSON, CMake
+  toolchain generation, bindgen sysroots, and pkg-config sysroot management are
+  not yet first-class Zirild features.
+- The mixed Rust/C/C++ fixture covers `cc-rs`, archives, and final linking, but
+  does not claim exhaustive compatibility with OpenSSL, `ring`, large CMake
+  projects, Tauri Android, or every custom-CRT/`no_std` layout.
+
+## Output paths and execution
+
+Artifacts use Cargo's normal locations:
+
+- `target/<cargo-target>/debug/` by default;
+- `target/<cargo-target>/release/` with `--release`.
+
+`run` and `test` require the host to execute the selected target. Use `build`
+or `check` for foreign targets unless a compatible runtime is available.
 
 ## License
 
