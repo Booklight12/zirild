@@ -75,6 +75,63 @@ example, `x86_64-windows-gnu` maps to `x86_64-pc-windows-gnu`, while the short
 Do not pass Cargo's `--target`; Zirild's `-target` is the single source of truth
 and is converted to the corresponding Rust target triple.
 
+## Target triple support
+
+The tables below distinguish real end-to-end validation from code paths that
+only appear compatible. A target in the theoretical table still requires its
+Rust standard library from `rustup target add`, and may require target system
+libraries or an SDK. Unless a target appears in the verified or theoretical
+table, do not assume that the current release supports it.
+
+### Verified and supported
+
+These targets have completed real mixed Rust/C/C++ builds. Runnable host or WSL
+outputs were executed; Android outputs were inspected but not run on a device.
+
+| Rust target triple | Native and final-link path | Verified result |
+| --- | --- | --- |
+| `x86_64-unknown-linux-gnu` | Zig | ELF built and ran in Ubuntu on WSL2 |
+| `x86_64-pc-windows-gnu` | Zig | PE built and ran on Windows |
+| `x86_64-pc-windows-msvc` | system MSVC compatibility path | PE built and ran on Windows; final link is not Zig |
+| `aarch64-linux-android` | explicit `-ndkfallback` | NDK Clang/LLD produced an ELF64 AArch64 PIE; device execution is unverified |
+| `x86_64-linux-android` | explicit `-ndkfallback` | NDK Clang/LLD produced an ELF64 x86-64 PIE; device execution is unverified |
+
+### Theoretically supported, not end-to-end validated
+
+For the Zig rows below, Zirild's Rust-to-Zig mapping is defined and the current
+Zig toolchain accepted a native C object compilation for the mapped target.
+That probe does not prove Rust final linking, C++ runtime availability, or
+execution on the destination system.
+
+| Rust target triple or triples | Expected path | Current evidence boundary |
+| --- | --- | --- |
+| `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-musl` | Zig | target mapping and native C compilation only |
+| `arm-unknown-linux-gnueabi`, `arm-unknown-linux-gnueabihf`, `arm-unknown-linux-musleabi`, `arm-unknown-linux-musleabihf` | Zig | target mapping and native C compilation only |
+| `loongarch64-unknown-linux-gnu`, `loongarch64-unknown-linux-musl` | Zig | target mapping and native C compilation only |
+| `powerpc-unknown-linux-gnu` | Zig | target mapping and native C compilation only |
+| `powerpc64-unknown-linux-gnu`, `powerpc64-unknown-linux-musl` | Zig | target mapping and native C compilation only |
+| `powerpc64le-unknown-linux-gnu`, `powerpc64le-unknown-linux-musl` | Zig | target mapping and native C compilation only |
+| `s390x-unknown-linux-gnu`, `sparc64-unknown-linux-gnu` | Zig | target mapping and native C compilation only |
+| `x86_64-unknown-linux-musl` | Zig | target mapping and native C compilation only |
+| `aarch64-apple-darwin`, `x86_64-apple-darwin` | Zig | basic target mapping and native C compilation only; Apple SDK/framework projects are not covered |
+| `i686-pc-windows-msvc`, `aarch64-pc-windows-msvc`, `arm64ec-pc-windows-msvc` | system MSVC compatibility path | orchestration path exists, but the required cross-MSVC tools and outputs were not validated |
+| `armv7-linux-androideabi`, `i686-linux-android` | explicit `-ndkfallback` | NDK compiler/ABI mapping exists, but no complete artifact was validated |
+
+### Currently unsupported by the implemented path
+
+| Rust target triple or family | Why it is not currently supported |
+| --- | --- |
+| `aarch64-linux-android`, `armv7-linux-androideabi`, `i686-linux-android`, and `x86_64-linux-android` without `-ndkfallback` | strict Zig mode can run `check`, but the current Zig distribution cannot final-link Android libc |
+| `arm-linux-androideabi`, `thumbv7neon-linux-androideabi` | not included in Zirild's explicit Android target and NDK compiler mapping |
+| `i586-unknown-linux-*`, `i686-unknown-linux-*` | Rust architecture names are not yet normalized to Zig's `x86` architecture spelling |
+| `armv5te-unknown-linux-*`, `armv7-unknown-linux-*`, `thumbv7neon-unknown-linux-*` | CPU-specific Rust architecture names are not yet normalized to Zig's `arm`/`thumb` target model |
+| `riscv64a23-unknown-linux-*`, `riscv64gc-unknown-linux-*` | Rust architecture/profile names are not yet normalized to Zig's `riscv64` target plus CPU features |
+| `i686-pc-windows-gnu`, `*-pc-windows-gnullvm` | the implemented Windows Zig-link and runtime rewrite is validated only for x86-64 GNU; `gnullvm` is not mapped to a Zig ABI |
+| `*-apple-ios`, `*-apple-tvos`, `*-apple-watchos`, `*-apple-visionos` | no Apple mobile target or SDK integration path is implemented |
+| `*-unknown-freebsd`, `*-unknown-netbsd`, `*-pc-solaris`, `*-unknown-illumos`, `*-unknown-linux-ohos` | no Rust-vendor-to-Zig target conversion and target SDK/sysroot policy is implemented |
+| `wasm32-*`, `*-unknown-uefi`, `*-unknown-none*`, CUDA, and other bare-metal or accelerator targets | they require target-specific link semantics rather than Zirild's current hosted C/C++ linker-wrapper path |
+| custom target JSON and minimum-glibc-suffixed targets | no separate Cargo-target/Zig-target model exists for these forms yet |
+
 ## Command reference
 
 ```text
@@ -238,15 +295,8 @@ goal.
 ## Validation
 
 The current source was validated on 2026-07-14 with a temporary standalone
-fixture outside the published package.
-
-| Rust target | Mode and linker | Result |
-| --- | --- | --- |
-| `aarch64-linux-android` | `-ndkfallback`, NDK 30.0.14904198 Clang/LLD | passed; ELF64 AArch64 PIE |
-| `x86_64-linux-android` | `-ndkfallback`, NDK 30.0.14904198 Clang/LLD | passed; ELF64 x86-64 PIE |
-| `x86_64-unknown-linux-gnu` | Zig | passed; mixed Rust/C/C++ ELF ran in Ubuntu WSL2 |
-| `x86_64-pc-windows-gnu` | Zig | passed; mixed Rust/C/C++ PE ran on Windows |
-| `x86_64-pc-windows-msvc` | system MSVC | passed; mixed Rust/C/C++ PE ran on Windows |
+fixture outside the published package. The exact targets and results are listed
+under [Target triple support](#target-triple-support).
 
 The native fixture used `cc-rs`, one C translation unit, one C++17 translation
 unit, and Rust `extern "C"` calls. Build traces confirmed the expected C, C++,
@@ -255,6 +305,10 @@ with exit code 0 and produced the expected interop results.
 
 Android artifacts were inspected with the selected NDK's `llvm-readelf`.
 Android device execution has not yet been validated.
+
+On 2026-07-15, Zig 0.17.0-dev.1282 accepted native C object compilation for
+each Zig target spelling listed in the theoretical table. This was a target
+mapping probe, not a Rust/C/C++ final-link or runtime validation.
 
 The latest reliability pass also verified that Windows linker source files
 remain unchanged, temporary wrapper files are removed after a successful
