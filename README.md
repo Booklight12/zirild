@@ -17,6 +17,7 @@ archiver, and linker selected around Cargo.
 | Target or mode | C/C++ and archives | Final linker | Current status |
 | --- | --- | --- | --- |
 | GNU-family targets | `zig cc`, `zig c++`, `zig ar` | Zig | primary path |
+| Linux musl targets | `zig cc`, `zig c++`, `zig ar` | Zig | supported; Zig's bundled musl CRT replaces rustc's self-contained CRT |
 | Windows GNU raw-dylib | Zig tools and `zig dlltool` | Zig | supported |
 | Windows MSVC | system MSVC tools | system MSVC linker | compatibility exception |
 | Android, default mode | Zig tools | Zig | `check` works; Android libc linking is currently unavailable in Zig |
@@ -91,6 +92,7 @@ outputs were executed; Android outputs were inspected but not run on a device.
 | Rust target triple | Native and final-link path | Verified result |
 | --- | --- | --- |
 | `x86_64-unknown-linux-gnu` | Zig | ELF built and ran in Ubuntu on WSL2 |
+| `x86_64-unknown-linux-musl` | Zig | statically linked PIE built and ran in WSL2 Linux |
 | `x86_64-pc-windows-gnu` | Zig | PE built and ran on Windows |
 | `x86_64-pc-windows-msvc` | system MSVC compatibility path | PE built and ran on Windows; final link is not Zig |
 | `aarch64-linux-android` | explicit `-ndkfallback` | NDK Clang/LLD produced an ELF64 AArch64 PIE; device execution is unverified |
@@ -112,7 +114,6 @@ execution on the destination system.
 | `powerpc64-unknown-linux-gnu`, `powerpc64-unknown-linux-musl` | Zig | target mapping and native C compilation only |
 | `powerpc64le-unknown-linux-gnu`, `powerpc64le-unknown-linux-musl` | Zig | target mapping and native C compilation only |
 | `s390x-unknown-linux-gnu`, `sparc64-unknown-linux-gnu` | Zig | target mapping and native C compilation only |
-| `x86_64-unknown-linux-musl` | Zig | target mapping and native C compilation only |
 | `aarch64-apple-darwin`, `x86_64-apple-darwin` | Zig | basic target mapping and native C compilation only; Apple SDK/framework projects are not covered |
 | `i686-pc-windows-msvc`, `aarch64-pc-windows-msvc`, `arm64ec-pc-windows-msvc` | system MSVC compatibility path | orchestration path exists, but the required cross-MSVC tools and outputs were not validated |
 | `armv7-linux-androideabi`, `i686-linux-android` | explicit `-ndkfallback` | NDK compiler/ABI mapping exists, but no complete artifact was validated |
@@ -272,6 +273,18 @@ dependencies. Applications using desktop libraries outside libc, such as DBus,
 GTK, X11, or WebKit2GTK, additionally need a target sysroot containing those
 libraries and their pkg-config metadata.
 
+### Linux musl
+
+Rust's musl targets use a self-contained CRT: rustc passes its own startup
+objects plus `-nostartfiles` and expects the linker driver to add none. Zig's
+cc driver ignores `-nostartfiles` and injects its bundled musl `crt1.o`
+anyway, and the explicit `-lc` on rustc's line defeats `-nostdlib`, so Zirild
+strips rustc's self-contained CRT objects from final musl links instead.
+Response files that rustc produces for long link lines are rewritten into
+filtered private copies. Zig's musl CRT and libc then stand alone, matching
+the GNU-target model. Only final links are affected; C and C++ compilation is
+unchanged.
+
 ### Windows
 
 Windows GNU uses Zig for C, C++, archives, raw-dylib import libraries, and final
@@ -305,6 +318,11 @@ with exit code 0 and produced the expected interop results.
 
 Android artifacts were inspected with the selected NDK's `llvm-readelf`.
 Android device execution has not yet been validated.
+
+On 2026-09-06, the musl final-link path was validated with a mixed Rust, C,
+and C++17 fixture built for `x86_64-unknown-linux-musl` through `cc-rs`; the
+statically linked PIE ran on Linux with the expected C and C++ interop
+results.
 
 On 2026-07-15, Zig 0.17.0-dev.1282 accepted native C object compilation for
 each Zig target spelling listed in the theoretical table. This was a target

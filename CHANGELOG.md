@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.1.8 - 2026-09-06
+
+- Link musl targets end to end through Zig: strip rustc's self-contained musl
+  CRT startup objects and `-nostartfiles` from final musl links, including
+  inside rustc `@response-file` arguments, which are rewritten into private
+  copies. Zig's cc driver ignores `-nostartfiles` and injects its own musl
+  `crt1.o` regardless, so without the strip rustc and Zig CRT objects collide
+  on `_start` and `_start_c`. Validated with a mixed Rust, C, and C++17
+  fixture whose statically linked PIE ran on Linux.
+
+## 0.1.7 - 2026-07-14
 
 - Stop reserving Cargo's `-Z` option; add `--zig-release-small` and the canonical
   `--zig-opt=<mode>` replacement for Zirild optimization selection.
@@ -17,6 +27,9 @@
   `--zig-path`, `--ndk-path`, and a public `--trace` option while retaining the
   legacy mixed-case environment variables and CLI spellings.
 - Report NDK LLVM, rather than Zig, when an Android fallback tool cannot start.
+
+## 0.1.6 - 2026-07-14
+
 - Ignore duplicate `--target` arguments injected by native build helpers such
   as `cc-rs`, preserving Zirild's Zig-compatible target mapping for C and C++.
 - Disable Zig's implicit C/C++ undefined-behavior sanitizer instrumentation by

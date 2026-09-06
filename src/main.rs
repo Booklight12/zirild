@@ -2,7 +2,7 @@
 
 use std::{
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
     process::{Command, ExitCode},
@@ -1061,6 +1061,10 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
             .to_string_lossy()
             .to_ascii_lowercase()
             .contains("-windows-");
+    let strip_musl_crt = mode == WrapperMode::Linker
+        && !ndk_fallback
+        && musl_self_contained_link(&target, &arguments);
+    let mut stripped_crt_arguments = 0usize;
     if windows_link
         && windows_runtime == WindowsRuntimePolicy::Auto
         && windows_runtime_may_be_custom(&arguments)
@@ -1071,6 +1075,10 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
     }
     let prepared_arguments = if windows_link {
         prepare_windows_linker_arguments(arguments, windows_runtime)?
+    } else if strip_musl_crt {
+        let (prepared, stripped) = prepare_musl_linker_arguments(arguments)?;
+        stripped_crt_arguments = stripped;
+        prepared
     } else {
         PreparedArguments::unchanged(arguments)
     };
@@ -1145,6 +1153,11 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
             arguments.len(),
         );
     }
+    if strip_musl_crt && env::var_os("CARGO_ZIRILD_TRACE").is_some() {
+        eprintln!(
+            "cargo-zirild trace: stripped {stripped_crt_arguments} rustc self-contained CRT arguments so Zig supplies the only musl CRT"
+        );
+    }
     let status = command.status();
     prepared_arguments.cleanup();
     let tool = if ndk_fallback { "NDK LLVM" } else { "Zig" };
@@ -1165,6 +1178,181 @@ fn is_native_optimization_argument(argument: &OsString) -> bool {
     matches!(
         argument.to_string_lossy().as_ref(),
         "-O" | "-O0" | "-O1" | "-O2" | "-O3" | "-Og" | "-Os" | "-Oz" | "-Ofast"
+    )
+}
+
+/// Whether rustc's link arguments represent a musl final link where rustc
+/// supplies its own CRT startup objects. Rustc passes those objects plus
+/// `-nostartfiles` to keep the linker driver from adding startup files of its
+/// own, but Zig's cc driver ignores `-nostartfiles` and injects its bundled
+/// musl `crt1.o` regardless, duplicating `_start` and `_start_c`. An explicit
+/// `-lc` on rustc's line also defeats `-nostdlib`, so the only stable
+/// composition is to strip rustc's CRT objects and let Zig's musl CRT stand
+/// alone, matching the GNU-target model where Zig already supplies the CRT.
+fn musl_self_contained_link(target: &OsStr, arguments: &[OsString]) -> bool {
+    if !target
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .ends_with("-musl")
+    {
+        return false;
+    }
+    arguments.iter().any(|argument| {
+        if argument == "-nostartfiles" || is_self_contained_crt_object(argument) {
+            return true;
+        }
+        let Some(path) = response_file_path(argument) else {
+            return false;
+        };
+        fs::read_to_string(&path)
+            .map(|contents| {
+                contents.lines().any(|line| {
+                    let argument = response_line_argument(line);
+                    argument == "-nostartfiles"
+                        || is_self_contained_crt_object(OsStr::new(&argument))
+                })
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// The response file path of a rustc `@file` linker argument, if any. rustc
+/// moves the whole link command into a response file once the command line
+/// grows past the platform limit, so long musl links carry their arguments
+/// there instead of in argv.
+fn response_file_path(argument: &OsString) -> Option<PathBuf> {
+    let text = argument.to_string_lossy();
+    let path = text.strip_prefix('@')?;
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
+}
+
+/// The logical argument carried by one rustc response-file line, which wraps
+/// each argument in optional double quotes.
+fn response_line_argument(line: &str) -> String {
+    line.trim().trim_matches('"').to_owned()
+}
+
+/// Strip rustc's self-contained musl CRT objects and `-nostartfiles` from the
+/// link arguments. Response files are rewritten into filtered private copies
+/// beside the wrapper executable; rustc's original inputs are never edited.
+/// Returns the prepared arguments and the number of stripped arguments and
+/// response-file lines.
+fn prepare_musl_linker_arguments(
+    arguments: Vec<OsString>,
+) -> Result<(PreparedArguments, usize), String> {
+    let wrapper =
+        env::current_exe().map_err(|err| format!("cannot locate cargo-zirild wrapper: {err}"))?;
+    let parent = wrapper
+        .parent()
+        .ok_or_else(|| "cargo-zirild wrapper has no parent directory".to_owned())?;
+    let directory = parent.join(format!("link-{}", std::process::id()));
+    fs::create_dir_all(&directory).map_err(|err| {
+        format!(
+            "cannot create private linker directory '{}': {err}",
+            directory.display()
+        )
+    })?;
+    let (prepared, stripped) = prepare_musl_arguments_in_directory(arguments, &directory)?;
+    Ok((
+        PreparedArguments {
+            arguments: prepared,
+            temporary_directory: Some(directory),
+        },
+        stripped,
+    ))
+}
+
+fn prepare_musl_arguments_in_directory(
+    arguments: Vec<OsString>,
+    directory: &Path,
+) -> Result<(Vec<OsString>, usize), String> {
+    let mut prepared = Vec::with_capacity(arguments.len());
+    let mut file_index = 0usize;
+    let mut stripped = 0usize;
+    for argument in arguments {
+        if let Some(response_path) = response_file_path(&argument) {
+            let (rewritten, dropped) =
+                prepare_musl_response_file(&response_path, directory, &mut file_index)?;
+            stripped += dropped;
+            prepared.push(format!("@{}", rewritten.display()).into());
+            continue;
+        }
+        if argument == "-nostartfiles" || is_self_contained_crt_object(&argument) {
+            stripped += 1;
+            continue;
+        }
+        prepared.push(argument);
+    }
+    Ok((prepared, stripped))
+}
+
+fn prepare_musl_response_file(
+    source: &Path,
+    directory: &Path,
+    file_index: &mut usize,
+) -> Result<(PathBuf, usize), String> {
+    let original = fs::read_to_string(source).map_err(|err| {
+        format!(
+            "cannot read linker response file '{}': {err}",
+            source.display()
+        )
+    })?;
+    let mut dropped = 0usize;
+    let rewritten: Vec<_> = original
+        .lines()
+        .filter(|line| {
+            let argument = response_line_argument(line);
+            let drop =
+                argument == "-nostartfiles" || is_self_contained_crt_object(OsStr::new(&argument));
+            if drop {
+                dropped += 1;
+            }
+            !drop
+        })
+        .collect();
+    let output = directory.join(format!("response-{}.rsp", *file_index));
+    *file_index += 1;
+    fs::write(&output, format!("{}\n", rewritten.join("\n"))).map_err(|err| {
+        format!(
+            "cannot write private linker response file '{}': {err}",
+            output.display()
+        )
+    })?;
+    Ok((output, dropped))
+}
+
+/// Whether a link argument is one of rustc's self-contained CRT startup
+/// objects, recognized by the `self-contained` sysroot path component and the
+/// object base name so identically named objects from build scripts survive.
+fn is_self_contained_crt_object(argument: &OsStr) -> bool {
+    let path = Path::new(argument);
+    let from_self_contained = path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("self-contained")
+    });
+    if !from_self_contained {
+        return false;
+    }
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    matches!(
+        name.to_string_lossy().to_ascii_lowercase().as_str(),
+        "crt1.o"
+            | "scrt1.o"
+            | "rcrt1.o"
+            | "crti.o"
+            | "crtn.o"
+            | "crtbegin.o"
+            | "crtbegins.o"
+            | "crtend.o"
+            | "crtends.o"
     )
 }
 
@@ -1633,6 +1821,114 @@ mod tests {
         assert!(!is_embedded_target_argument(&OsString::from("-m64")));
         assert!(is_native_optimization_argument(&OsString::from("-O3")));
         assert!(!is_native_optimization_argument(&OsString::from("-g")));
+    }
+
+    #[test]
+    fn detects_musl_self_contained_links_by_target_and_nostartfiles() {
+        let arguments = vec![OsString::from("-nostartfiles")];
+        assert!(musl_self_contained_link(
+            OsStr::new("x86_64-linux-musl"),
+            &arguments
+        ));
+        assert!(musl_self_contained_link(
+            OsStr::new("aarch64-linux-musl"),
+            &arguments
+        ));
+        assert!(!musl_self_contained_link(
+            OsStr::new("x86_64-linux-gnu"),
+            &arguments
+        ));
+        assert!(!musl_self_contained_link(
+            OsStr::new("x86_64-linux-musl"),
+            &[]
+        ));
+        assert!(!musl_self_contained_link(
+            OsStr::new("x86_64-windows-gnu"),
+            &arguments
+        ));
+    }
+
+    #[test]
+    fn recognizes_self_contained_crt_objects_without_touching_other_inputs() {
+        assert!(is_self_contained_crt_object(&OsString::from(
+            "C:\\Users\\dev\\.rustup\\toolchains\\stable\\lib\\rustlib\\x86_64-unknown-linux-musl\\lib\\self-contained\\rcrt1.o"
+        )));
+        assert!(is_self_contained_crt_object(&OsString::from(
+            "/home/dev/.rustup/toolchains/stable/lib/rustlib/aarch64-unknown-linux-musl/lib/self-contained/crti.o"
+        )));
+        assert!(is_self_contained_crt_object(&OsString::from(
+            "C:\\sysroot\\Self-Contained\\CRTBEGINS.O".to_ascii_lowercase()
+        )));
+        assert!(!is_self_contained_crt_object(&OsString::from(
+            "D:\\project\\native\\crt1.o"
+        )));
+        assert!(!is_self_contained_crt_object(&OsString::from(
+            "C:\\sysroot\\lib\\rustlib\\x86_64-unknown-linux-musl\\lib\\self-contained\\libc.a"
+        )));
+        assert!(!is_self_contained_crt_object(&OsString::from(
+            "-nostartfiles"
+        )));
+    }
+
+    #[test]
+    fn detects_musl_self_contained_links_inside_response_files() {
+        let root = env::temp_dir().join(format!("cargo-zirild-musl-detect-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let response = root.join("link.rsp");
+        fs::write(&response, "\"-m64\"\n\"-nostartfiles\"\n").unwrap();
+        let arguments = vec![OsString::from(format!("@{}", response.display()))];
+        assert!(musl_self_contained_link(
+            OsStr::new("x86_64-linux-musl"),
+            &arguments
+        ));
+        fs::write(
+            &response,
+            "\"-m64\"\n\"C:\\rust\\sysroot\\lib\\rustlib\\x86_64-unknown-linux-musl\\lib\\self-contained\\rcrt1.o\"\n",
+        )
+        .unwrap();
+        assert!(musl_self_contained_link(
+            OsStr::new("x86_64-linux-musl"),
+            &arguments
+        ));
+        fs::write(&response, "\"-m64\"\n\"-static-pie\"\n").unwrap();
+        assert!(!musl_self_contained_link(
+            OsStr::new("x86_64-linux-musl"),
+            &arguments
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn strips_musl_crt_from_arguments_and_private_response_copies() {
+        let root =
+            env::temp_dir().join(format!("cargo-zirild-musl-prepare-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let directory = root.join("private");
+        fs::create_dir_all(&directory).unwrap();
+        let response = root.join("link.rsp");
+        let crt = "C:\\rust\\sysroot\\lib\\rustlib\\x86_64-unknown-linux-musl\\lib\\self-contained\\rcrt1.o";
+        let original = format!("\"-m64\"\n\"{crt}\"\n\"-nostartfiles\"\n\"-static-pie\"\n");
+        fs::write(&response, &original).unwrap();
+        let arguments = vec![
+            OsString::from(format!("@{}", response.display())),
+            OsString::from(crt),
+            OsString::from("-nostartfiles"),
+            OsString::from("-lc"),
+        ];
+        let (prepared, stripped) =
+            prepare_musl_arguments_in_directory(arguments, &directory).unwrap();
+        assert_eq!(stripped, 4);
+        assert_eq!(prepared.len(), 2);
+        assert!(prepared[0].to_string_lossy().starts_with('@'));
+        assert_eq!(prepared[1], OsString::from("-lc"));
+        let rewritten = fs::read_to_string(PathBuf::from(
+            prepared[0].to_string_lossy().strip_prefix('@').unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(rewritten, "\"-m64\"\n\"-static-pie\"\n");
+        assert_eq!(fs::read_to_string(&response).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
