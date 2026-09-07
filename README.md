@@ -140,7 +140,11 @@ cargo zirild -target=<zig-target> [zirild options] [cargo command] [cargo option
 ```
 
 Supported Cargo commands are `build` (default), `check`, `run`, `test`,
-`bench`, `rustc`, `clippy`, and `doc`. Other arguments, including `--package`,
+`bench`, `rustc`, `clippy`, `doc`, and `asm` (dispatched to the installed
+cargo-show-asm plugin with Zirild's wrapper environment, so
+`cargo zirild -target=<target> asm <function>` inspects the cross-compiled
+code; `-target` is forwarded as cargo-asm's `--target` unless the asm
+arguments provide one). Other arguments, including `--package`,
 `--bin`, `--features`, `--locked`, and arguments after `--`, are passed to the
 selected Cargo command.
 
@@ -284,6 +288,10 @@ Response files that rustc produces for long link lines are rewritten into
 filtered private copies. Zig's musl CRT and libc then stand alone, matching
 the GNU-target model. Only final links are affected; C and C++ compilation is
 unchanged.
+
+For aarch64 final links, Zirild also removes rustc's Cortex-A53 workaround
+switch (`-Wl,--fix-cortex-a53-843419`), which Zig's cc driver rejects as an
+unsupported linker argument.
 
 ### Windows
 

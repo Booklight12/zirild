@@ -467,6 +467,7 @@ fn cargo_command_name(argument: &str) -> Option<&'static str> {
         "rustc" => Some("rustc"),
         "clippy" => Some("clippy"),
         "doc" => Some("doc"),
+        "asm" => Some("asm"),
         _ => None,
     }
 }
@@ -836,13 +837,106 @@ fn run_cargo(
     wrappers: &Wrappers,
     android_ndk: Option<&AndroidNdk>,
 ) -> Result<(), String> {
-    let mut command = Command::new("cargo");
-    command
-        .arg(&options.cargo_command)
-        .arg("--target")
-        .arg(&options.cargo_target)
-        .args(&options.cargo_args);
+    let mut command = cargo_command(options);
+    apply_wrapper_environment(&mut command, options, zig, wrappers, android_ndk)?;
 
+    let is_msvc = options.cargo_target.ends_with("-msvc");
+    if is_msvc {
+        eprintln!(
+            "+ cargo {} --target {} (MSVC toolchain / {})",
+            options.cargo_command, options.cargo_target, options.optimize
+        );
+    } else if options.android.ndk_fallback {
+        let ndk = android_ndk.expect("fallback is validated as Android-only");
+        eprintln!(
+            "cargo-zirild: WARNING: -ndkfallback enabled. This build uses Android NDK Clang/LLD directly; the final output is not linked by Zig."
+        );
+        eprintln!(
+            "+ cargo {} --target {} (Android NDK Clang/LLD fallback {} at {} / {})",
+            options.cargo_command,
+            options.cargo_target,
+            ndk.version,
+            ndk.root.display(),
+            options.optimize
+        );
+    } else if let Some(ndk) = android_ndk {
+        eprintln!(
+            "+ cargo {} --target {} (Zig {} / Android NDK {} at {} / {})",
+            options.cargo_command,
+            options.cargo_target,
+            options.zig_target,
+            ndk.version,
+            ndk.root.display(),
+            options.optimize
+        );
+    } else {
+        eprintln!(
+            "+ cargo {} --target {} (Zig {} / {})",
+            options.cargo_command, options.cargo_target, options.zig_target, options.optimize
+        );
+    }
+    let tool = if options.cargo_command == "asm" {
+        "cargo-asm"
+    } else {
+        "cargo"
+    };
+    let status = command
+        .status()
+        .map_err(|err| format!("failed to start {tool}: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "cargo {} failed with {status}",
+            options.cargo_command
+        ))
+    }
+}
+
+/// The command to run for the requested Cargo command. The `asm` command is a
+/// Cargo plugin, so dispatch `cargo-asm` the way Cargo would and forward
+/// Zirild's `-target` as cargo-asm's `--target`; otherwise the viewer would
+/// inspect the host build while the wrappers are configured for the target.
+fn cargo_command(options: &BuildOptions) -> Command {
+    if options.cargo_command == "asm" {
+        let mut command = Command::new("cargo-asm");
+        command.arg("asm");
+        if !has_asm_target_argument(&options.cargo_args) {
+            command.arg("--target").arg(&options.cargo_target);
+        }
+        command.args(&options.cargo_args);
+        command
+    } else {
+        let mut command = Command::new("cargo");
+        command
+            .arg(&options.cargo_command)
+            .arg("--target")
+            .arg(&options.cargo_target)
+            .args(&options.cargo_args);
+        command
+    }
+}
+
+/// Whether the user passed their own cargo-asm `--target`, which keeps the
+/// viewer on the target they selected.
+fn has_asm_target_argument(arguments: &[OsString]) -> bool {
+    arguments.iter().any(|argument| {
+        let argument = argument.to_string_lossy();
+        argument == "--target" || argument.starts_with("--target=")
+    })
+}
+
+/// Configure the environment for the delegate process the way Cargo itself
+/// would receive it: wrapper tool locations, the Zig and Android parameters
+/// the wrappers read, and the PATH order that lets the wrappers find
+/// `zig dlltool` when Windows GNU needs it.
+fn apply_wrapper_environment(
+    command: &mut Command,
+    options: &BuildOptions,
+    zig: Option<&Path>,
+    wrappers: &Wrappers,
+    android_ndk: Option<&AndroidNdk>,
+) -> Result<(), String> {
     if let Some(zig) = zig {
         command.env("CARGO_ZIRILD_ZIG", zig);
     }
@@ -914,52 +1008,7 @@ fn run_cargo(
             .map_err(|err| format!("cannot construct PATH for Zig dlltool: {err}"))?;
         command.env("PATH", path);
     }
-
-    if is_msvc {
-        eprintln!(
-            "+ cargo {} --target {} (MSVC toolchain / {})",
-            options.cargo_command, options.cargo_target, options.optimize
-        );
-    } else if options.android.ndk_fallback {
-        let ndk = android_ndk.expect("fallback is validated as Android-only");
-        eprintln!(
-            "cargo-zirild: WARNING: -ndkfallback enabled. This build uses Android NDK Clang/LLD directly; the final output is not linked by Zig."
-        );
-        eprintln!(
-            "+ cargo {} --target {} (Android NDK Clang/LLD fallback {} at {} / {})",
-            options.cargo_command,
-            options.cargo_target,
-            ndk.version,
-            ndk.root.display(),
-            options.optimize
-        );
-    } else if let Some(ndk) = android_ndk {
-        eprintln!(
-            "+ cargo {} --target {} (Zig {} / Android NDK {} at {} / {})",
-            options.cargo_command,
-            options.cargo_target,
-            options.zig_target,
-            ndk.version,
-            ndk.root.display(),
-            options.optimize
-        );
-    } else {
-        eprintln!(
-            "+ cargo {} --target {} (Zig {} / {})",
-            options.cargo_command, options.cargo_target, options.zig_target, options.optimize
-        );
-    }
-    let status = command
-        .status()
-        .map_err(|err| format!("failed to start cargo: {err}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "cargo {} failed with {status}",
-            options.cargo_command
-        ))
-    }
+    Ok(())
 }
 
 fn wrapper_mode() -> Option<WrapperMode> {
@@ -1064,7 +1113,15 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
     let strip_musl_crt = mode == WrapperMode::Linker
         && !ndk_fallback
         && musl_self_contained_link(&target, &arguments);
-    let mut stripped_crt_arguments = 0usize;
+    let strip_cortex_a53_fix = mode == WrapperMode::Linker
+        && !ndk_fallback
+        && target
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .contains("aarch64")
+        && has_cortex_a53_fix_argument(&arguments);
+    let linux_linker_rewrites = strip_musl_crt || strip_cortex_a53_fix;
+    let mut stripped_arguments = 0usize;
     if windows_link
         && windows_runtime == WindowsRuntimePolicy::Auto
         && windows_runtime_may_be_custom(&arguments)
@@ -1075,9 +1132,10 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
     }
     let prepared_arguments = if windows_link {
         prepare_windows_linker_arguments(arguments, windows_runtime)?
-    } else if strip_musl_crt {
-        let (prepared, stripped) = prepare_musl_linker_arguments(arguments)?;
-        stripped_crt_arguments = stripped;
+    } else if linux_linker_rewrites {
+        let (prepared, stripped) =
+            prepare_linux_linker_arguments(arguments, strip_musl_crt, strip_cortex_a53_fix)?;
+        stripped_arguments = stripped;
         prepared
     } else {
         PreparedArguments::unchanged(arguments)
@@ -1155,7 +1213,12 @@ fn run_wrapper(mode: WrapperMode) -> Result<(), String> {
     }
     if strip_musl_crt && env::var_os("CARGO_ZIRILD_TRACE").is_some() {
         eprintln!(
-            "cargo-zirild trace: stripped {stripped_crt_arguments} rustc self-contained CRT arguments so Zig supplies the only musl CRT"
+            "cargo-zirild trace: stripped {stripped_arguments} rustc self-contained CRT arguments so Zig supplies the only musl CRT"
+        );
+    }
+    if strip_cortex_a53_fix && env::var_os("CARGO_ZIRILD_TRACE").is_some() {
+        eprintln!(
+            "cargo-zirild trace: stripped rustc's Cortex-A53 workaround linker switch, which Zig's cc driver rejects"
         );
     }
     let status = command.status();
@@ -1236,13 +1299,41 @@ fn response_line_argument(line: &str) -> String {
     line.trim().trim_matches('"').to_owned()
 }
 
-/// Strip rustc's self-contained musl CRT objects and `-nostartfiles` from the
-/// link arguments. Response files are rewritten into filtered private copies
-/// beside the wrapper executable; rustc's original inputs are never edited.
-/// Returns the prepared arguments and the number of stripped arguments and
-/// response-file lines.
-fn prepare_musl_linker_arguments(
+/// rustc passes a Cortex-A53 erratum workaround switch (`--fix-cortex-a53-843419`)
+/// to the linker for aarch64 targets. Zig's cc driver rejects it as an
+/// unsupported linker argument, so Zirild drops it from the link command,
+/// leaving the resulting switch-free link fully under Zig's control.
+fn has_cortex_a53_fix_argument(arguments: &[OsString]) -> bool {
+    arguments.iter().any(|argument| {
+        if is_cortex_a53_fix_argument(argument) {
+            return true;
+        }
+        let Some(path) = response_file_path(argument) else {
+            return false;
+        };
+        fs::read_to_string(&path)
+            .map(|contents| {
+                contents
+                    .lines()
+                    .any(|line| response_line_argument(line) == "-Wl,--fix-cortex-a53-843419")
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn is_cortex_a53_fix_argument(argument: &OsString) -> bool {
+    argument == "-Wl,--fix-cortex-a53-843419"
+}
+
+/// Strip rustc's self-contained musl CRT objects, `-nostartfiles`, and the
+/// aarch64 Cortex-A53 workaround switch from the link arguments. Response
+/// files are rewritten into filtered private copies beside the wrapper
+/// executable; rustc's original inputs are never edited. Returns the prepared
+/// arguments and the number of stripped arguments and response-file lines.
+fn prepare_linux_linker_arguments(
     arguments: Vec<OsString>,
+    strip_musl_crt: bool,
+    strip_cortex_a53_fix: bool,
 ) -> Result<(PreparedArguments, usize), String> {
     let wrapper =
         env::current_exe().map_err(|err| format!("cannot locate cargo-zirild wrapper: {err}"))?;
@@ -1256,7 +1347,12 @@ fn prepare_musl_linker_arguments(
             directory.display()
         )
     })?;
-    let (prepared, stripped) = prepare_musl_arguments_in_directory(arguments, &directory)?;
+    let (prepared, stripped) = prepare_linux_arguments_in_directory(
+        arguments,
+        &directory,
+        strip_musl_crt,
+        strip_cortex_a53_fix,
+    )?;
     Ok((
         PreparedArguments {
             arguments: prepared,
@@ -1266,22 +1362,30 @@ fn prepare_musl_linker_arguments(
     ))
 }
 
-fn prepare_musl_arguments_in_directory(
+fn prepare_linux_arguments_in_directory(
     arguments: Vec<OsString>,
     directory: &Path,
+    strip_musl_crt: bool,
+    strip_cortex_a53_fix: bool,
 ) -> Result<(Vec<OsString>, usize), String> {
     let mut prepared = Vec::with_capacity(arguments.len());
     let mut file_index = 0usize;
     let mut stripped = 0usize;
     for argument in arguments {
         if let Some(response_path) = response_file_path(&argument) {
-            let (rewritten, dropped) =
-                prepare_musl_response_file(&response_path, directory, &mut file_index)?;
+            let (rewritten, dropped) = prepare_linux_response_file(
+                &response_path,
+                directory,
+                &mut file_index,
+                strip_musl_crt,
+                strip_cortex_a53_fix,
+            )?;
             stripped += dropped;
             prepared.push(format!("@{}", rewritten.display()).into());
             continue;
         }
-        if argument == "-nostartfiles" || is_self_contained_crt_object(&argument) {
+        let value = argument.to_string_lossy();
+        if drops_linux_linker_argument(&value, strip_musl_crt, strip_cortex_a53_fix) {
             stripped += 1;
             continue;
         }
@@ -1290,10 +1394,12 @@ fn prepare_musl_arguments_in_directory(
     Ok((prepared, stripped))
 }
 
-fn prepare_musl_response_file(
+fn prepare_linux_response_file(
     source: &Path,
     directory: &Path,
     file_index: &mut usize,
+    strip_musl_crt: bool,
+    strip_cortex_a53_fix: bool,
 ) -> Result<(PathBuf, usize), String> {
     let original = fs::read_to_string(source).map_err(|err| {
         format!(
@@ -1306,8 +1412,7 @@ fn prepare_musl_response_file(
         .lines()
         .filter(|line| {
             let argument = response_line_argument(line);
-            let drop =
-                argument == "-nostartfiles" || is_self_contained_crt_object(OsStr::new(&argument));
+            let drop = drops_linux_linker_argument(&argument, strip_musl_crt, strip_cortex_a53_fix);
             if drop {
                 dropped += 1;
             }
@@ -1323,6 +1428,18 @@ fn prepare_musl_response_file(
         )
     })?;
     Ok((output, dropped))
+}
+
+/// Whether rustc's Linux linker argument is one Zirild must drop, either the
+/// musl self-contained CRT markers or the aarch64 Cortex-A53 switch.
+fn drops_linux_linker_argument(
+    argument: &str,
+    strip_musl_crt: bool,
+    strip_cortex_a53_fix: bool,
+) -> bool {
+    (strip_musl_crt
+        && (argument == "-nostartfiles" || is_self_contained_crt_object(OsStr::new(argument))))
+        || (strip_cortex_a53_fix && argument == "-Wl,--fix-cortex-a53-843419")
 }
 
 /// Whether a link argument is one of rustc's self-contained CRT startup
@@ -1917,7 +2034,7 @@ mod tests {
             OsString::from("-lc"),
         ];
         let (prepared, stripped) =
-            prepare_musl_arguments_in_directory(arguments, &directory).unwrap();
+            prepare_linux_arguments_in_directory(arguments, &directory, true, false).unwrap();
         assert_eq!(stripped, 4);
         assert_eq!(prepared.len(), 2);
         assert!(prepared[0].to_string_lossy().starts_with('@'));
@@ -1929,6 +2046,42 @@ mod tests {
         assert_eq!(rewritten, "\"-m64\"\n\"-static-pie\"\n");
         assert_eq!(fs::read_to_string(&response).unwrap(), original);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn strips_cortex_a53_switch_from_aarch64_links() {
+        let root = env::temp_dir().join(format!("cargo-zirild-cortex-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let directory = root.join("private");
+        fs::create_dir_all(&directory).unwrap();
+        let response = root.join("link.rsp");
+        let original = "\"-m64\"\n\"-Wl,--fix-cortex-a53-843419\"\n\"-static\"\n";
+        fs::write(&response, original).unwrap();
+        let arguments = vec![
+            OsString::from(format!("@{}", response.display())),
+            OsString::from("-Wl,--fix-cortex-a53-843419"),
+            OsString::from("-lc"),
+        ];
+        let (prepared, stripped) =
+            prepare_linux_arguments_in_directory(arguments, &directory, false, true).unwrap();
+        assert_eq!(stripped, 2);
+        assert_eq!(prepared.len(), 2);
+        assert!(prepared[1] == OsString::from("-lc"));
+        let rewritten = fs::read_to_string(PathBuf::from(
+            prepared[0].to_string_lossy().strip_prefix('@').unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(rewritten, "\"-m64\"\n\"-static\"\n");
+        assert_eq!(fs::read_to_string(&response).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detects_cortex_a53_switch_in_arguments_and_response_files() {
+        assert!(has_cortex_a53_fix_argument(&[OsString::from(
+            "-Wl,--fix-cortex-a53-843419"
+        )]));
+        assert!(!has_cortex_a53_fix_argument(&[OsString::from("-lc")]));
     }
 
     #[test]
@@ -2011,6 +2164,31 @@ mod tests {
         assert_eq!(options.cargo_command, "run");
         assert_eq!(options.cargo_args, vec![OsString::from("--release")]);
         assert_eq!(options.optimize, "ReleaseFast");
+    }
+
+    #[test]
+    fn parses_asm_command_after_zirild_options() {
+        let options = parse_args(vec![
+            "-target=x86_64-unknown-linux-musl".into(),
+            "asm".into(),
+            "add".into(),
+        ])
+        .unwrap();
+        assert_eq!(options.cargo_command, "asm");
+        assert_eq!(options.cargo_args, vec![OsString::from("add")]);
+        assert_eq!(options.zig_target, "x86_64-linux-musl");
+    }
+
+    #[test]
+    fn forwards_asm_target_to_plugin_unless_user_chooses_one() {
+        assert!(!has_asm_target_argument(&[OsString::from("add")]));
+        assert!(has_asm_target_argument(&[OsString::from("--target")]));
+        assert!(has_asm_target_argument(&[OsString::from(
+            "--target=aarch64-unknown-linux-musl"
+        )]));
+        assert!(!has_asm_target_argument(&[OsString::from(
+            "--targetname=add"
+        )]));
     }
 
     #[test]

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.9 - 2026-09-07
+
+- Support the `asm` Cargo command: dispatch the installed cargo-show-asm plugin
+  with Zirild's wrapper environment, so `cargo zirild -target=<target> asm
+  <function>` inspects the cross-compiled code. The `-target` is forwarded as
+  cargo-asm's `--target` unless the asm arguments provide one.
+- Drop rustc's aarch64 Cortex-A53 workaround linker switch
+  (`-Wl,--fix-cortex-a53-843419`) from final links, which Zig's cc driver
+  rejects as an unsupported linker argument. Validated by dumping the aarch64
+  musl assembly of a tokio-based project through cargo-show-asm.
+
 ## 0.1.8 - 2026-09-06
 
 - Link musl targets end to end through Zig: strip rustc's self-contained musl
