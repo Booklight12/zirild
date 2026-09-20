@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Report the toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Covers the unit tests and the command-line contract tests.
+      - name: Test
+        run: cargo test
+
+      # The mixed fixture is a standalone crate excluded from the published
+      # package, so it is built explicitly. This covers the Rust, C, and C++17
+      # interop the native wrapper modes exist for, on both hosts; the targets
+      # that go through Zig's final link are covered by the zig-targets job.
+      - name: Build and run the mixed fixture natively
+        working-directory: examples/mixed
+        run: cargo run
+
+  zig-targets:
+    name: zig-linked targets (windows)
+    runs-on: windows-latest
+    env:
+      # Keep this in step with the Zig version recorded under "Validation" in
+      # README.md. Both describe the toolchain the current support matrix was
+      # proven against, so they must move together.
+      ZIG_VERSION: 0.16.0
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Add the cross targets
+        run: rustup target add x86_64-pc-windows-gnu x86_64-unknown-linux-musl
+
+      - name: Build cargo-zirild
+        run: cargo build
+
+      - name: Windows GNU through the Zig final link
+        working-directory: examples/mixed
+        shell: pwsh
+        run: |
+          $log = & "$env:GITHUB_WORKSPACE\target\debug\cargo-zirild.exe" zirild -target=x86_64-pc-windows-gnu run 2>&1 | Out-String
+          $log
+          if ($log -notmatch "Zig $env:ZIG_VERSION") {
+            throw "the Windows GNU build did not report Zig $env:ZIG_VERSION"
+          }
+          if ($log -notmatch "mixed Rust/C/C\+\+ interop ok") {
+            throw "the Windows GNU fixture failed its interop check"
+          }
+
+      - name: Linux musl through the Zig final link
+        working-directory: examples/mixed
+        shell: pwsh
+        run: |
+          $log = & "$env:GITHUB_WORKSPACE\target\debug\cargo-zirild.exe" zirild -target=x86_64-unknown-linux-musl build 2>&1 | Out-String
+          $log
+          if ($log -notmatch "Zig $env:ZIG_VERSION") {
+            throw "the musl build did not report Zig $env:ZIG_VERSION"
+          }
+          if (-not (Test-Path "target\x86_64-unknown-linux-musl\debug\zirild-mixed-fixture")) {
+            throw "the musl artifact is missing"
+          }

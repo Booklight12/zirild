@@ -12,6 +12,7 @@ homepage = "https://github.com/Booklight12/zirild"
 repository = "https://github.com/Booklight12/zirild"
 keywords = ["cargo", "zig", "cross-compilation", "cxx"]
 categories = ["command-line-utilities", "development-tools::build-utils"]
+exclude = [".workbuddy", "examples/mixed"]
 
 [dependencies]
 

@@ -1,0 +1,12 @@
+# Keep the committed bytes and the working tree identical across hosts: this
+# project is developed on Windows and its CI runs on both Windows and Linux, so
+# no file may depend on the host's line-ending default.
+* text=auto eol=lf
+
+# Native binaries and archives must never be line-ending converted.
+*.exe binary
+*.dll binary
+*.lib binary
+*.a binary
+*.o binary
+*.rlib binary

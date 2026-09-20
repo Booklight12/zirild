@@ -8,6 +8,8 @@ use std::{
     process::{Command, ExitCode},
 };
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 const USAGE: &str = r#"cargo-zirild - run Cargo commands with the Zig toolchain
 
 Usage:
@@ -37,15 +39,21 @@ Other options:
   --preserve-linker-args      Alias for --windows-runtime=preserve
   --trace                     Print native wrapper invocation details
   -h, --help                  Show this help
+  -V, --version               Print the cargo-zirild version
 
 Cargo command:
-  build (default), check, run, test, bench, rustc, clippy, or doc
+  build (default), check, run, test, bench, rustc, clippy, doc, or asm
 
 The Cargo command, when present, must precede its Cargo options. Arguments after
 that command are passed to Cargo; Zirild only observes --release and rejects a
 second Cargo --target. With no command, the first non-Zirild option starts the
 default build's Cargo arguments. Cargo's -Z and its following value are
 preserved. Zirild's -target is the single source of truth.
+
+The asm command dispatches to the installed cargo-show-asm plugin with Zirild's
+wrapper environment, so cargo zirild -target=<target> asm <function> inspects the
+cross-compiled code. Zirild's -target is forwarded as cargo-asm's --target unless
+the asm arguments already provide one.
 
 Zig location:
   Lookup order: --zig-path, CARGO_ZIRILD_ZIG_PATH, ZIG, ZIG_HOME, Zig_home,
@@ -160,9 +168,16 @@ fn run_driver(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     if args.first().is_some_and(|argument| argument == "zirild") {
         args.remove(0);
     }
-    if requests_driver_help(&args) {
-        print!("{USAGE}");
-        return Ok(());
+    match driver_request(&args) {
+        Some(DriverRequest::Help) => {
+            print!("{USAGE}");
+            return Ok(());
+        }
+        Some(DriverRequest::Version) => {
+            println!("cargo-zirild {VERSION}");
+            return Ok(());
+        }
+        None => {}
     }
 
     let options = parse_args(args)?;
@@ -185,25 +200,37 @@ fn run_driver(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         options.android.ndk_fallback,
     );
     let wrappers = make_wrappers()?;
-    let result = run_cargo(&options, zig.as_deref(), &wrappers, android_ndk.as_ref());
+    let result = run_cargo(&options, zig.as_ref(), &wrappers, android_ndk.as_ref());
     let _ = fs::remove_dir_all(&wrappers.directory);
     result
 }
 
-fn requests_driver_help(arguments: &[OsString]) -> bool {
+/// A request Zirild must answer itself, before any Cargo work happens. Both are
+/// only recognized ahead of the Cargo command, so `cargo zirild run -- --version`
+/// still forwards `--version` to the produced executable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DriverRequest {
+    Help,
+    Version,
+}
+
+fn driver_request(arguments: &[OsString]) -> Option<DriverRequest> {
     for argument in arguments {
         let text = argument.to_string_lossy();
         if argument == "zirild" {
             continue;
         }
         if argument == "--help" || argument == "-h" {
-            return true;
+            return Some(DriverRequest::Help);
+        }
+        if argument == "--version" || argument == "-V" {
+            return Some(DriverRequest::Version);
         }
         if cargo_command_name(&text).is_some() || !is_zirild_option_spelling(&text) {
-            return false;
+            return None;
         }
     }
-    false
+    None
 }
 
 fn is_zirild_option_spelling(argument: &str) -> bool {
@@ -485,7 +512,18 @@ fn validate_optimize(value: &str) -> Result<String, String> {
     }
 }
 
-fn zig_executable(zig_patch: Option<&Path>) -> Result<PathBuf, String> {
+/// A validated Zig installation. `verify_zig` already runs `zig version`, so the
+/// reported version travels with the executable instead of being discarded: Zig
+/// C/C++ and LLD argument handling changes between releases, and a build log
+/// that omits the version cannot be compared against the documented validation
+/// record.
+#[derive(Debug)]
+struct ZigToolchain {
+    path: PathBuf,
+    version: String,
+}
+
+fn zig_executable(zig_patch: Option<&Path>) -> Result<ZigToolchain, String> {
     if let Some(path) = zig_patch {
         return validate_zig_path(path, "--zig-path");
     }
@@ -519,7 +557,7 @@ fn executable_on_path(name: &str) -> Option<PathBuf> {
     })
 }
 
-fn validate_zig_path(path: &Path, source: &str) -> Result<PathBuf, String> {
+fn validate_zig_path(path: &Path, source: &str) -> Result<ZigToolchain, String> {
     if path.is_file() {
         return verify_zig(path, source);
     }
@@ -547,20 +585,29 @@ fn validate_zig_path(path: &Path, source: &str) -> Result<PathBuf, String> {
     verify_zig(&executable, source)
 }
 
-fn verify_zig(executable: &Path, source: &str) -> Result<PathBuf, String> {
+fn verify_zig(executable: &Path, source: &str) -> Result<ZigToolchain, String> {
     let output = Command::new(executable)
         .arg("version")
         .output()
         .map_err(|err| format!("{source} does not point to an executable Zig: {err}"))?;
-    if output.status.success() {
-        Ok(executable.into())
-    } else {
-        Err(format!(
+    if !output.status.success() {
+        return Err(format!(
             "{source} points to '{}', but Zig version validation failed with {}",
             executable.display(),
             output.status
-        ))
+        ));
     }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if version.is_empty() {
+        return Err(format!(
+            "{source} points to '{}', but 'zig version' reported no version",
+            executable.display()
+        ));
+    }
+    Ok(ZigToolchain {
+        path: executable.into(),
+        version,
+    })
 }
 
 fn is_android_target(target: &str) -> bool {
@@ -833,7 +880,7 @@ fn make_wrappers() -> Result<Wrappers, String> {
 
 fn run_cargo(
     options: &BuildOptions,
-    zig: Option<&Path>,
+    zig: Option<&ZigToolchain>,
     wrappers: &Wrappers,
     android_ndk: Option<&AndroidNdk>,
 ) -> Result<(), String> {
@@ -841,6 +888,7 @@ fn run_cargo(
     apply_wrapper_environment(&mut command, options, zig, wrappers, android_ndk)?;
 
     let is_msvc = options.cargo_target.ends_with("-msvc");
+    let zig_version = zig.map_or("unversioned", |toolchain| toolchain.version.as_str());
     if is_msvc {
         eprintln!(
             "+ cargo {} --target {} (MSVC toolchain / {})",
@@ -861,9 +909,10 @@ fn run_cargo(
         );
     } else if let Some(ndk) = android_ndk {
         eprintln!(
-            "+ cargo {} --target {} (Zig {} / Android NDK {} at {} / {})",
+            "+ cargo {} --target {} (Zig {} / {} / Android NDK {} at {} / {})",
             options.cargo_command,
             options.cargo_target,
+            zig_version,
             options.zig_target,
             ndk.version,
             ndk.root.display(),
@@ -871,8 +920,12 @@ fn run_cargo(
         );
     } else {
         eprintln!(
-            "+ cargo {} --target {} (Zig {} / {})",
-            options.cargo_command, options.cargo_target, options.zig_target, options.optimize
+            "+ cargo {} --target {} (Zig {} / {} / {})",
+            options.cargo_command,
+            options.cargo_target,
+            zig_version,
+            options.zig_target,
+            options.optimize
         );
     }
     let tool = if options.cargo_command == "asm" {
@@ -933,12 +986,12 @@ fn has_asm_target_argument(arguments: &[OsString]) -> bool {
 fn apply_wrapper_environment(
     command: &mut Command,
     options: &BuildOptions,
-    zig: Option<&Path>,
+    zig: Option<&ZigToolchain>,
     wrappers: &Wrappers,
     android_ndk: Option<&AndroidNdk>,
 ) -> Result<(), String> {
     if let Some(zig) = zig {
-        command.env("CARGO_ZIRILD_ZIG", zig);
+        command.env("CARGO_ZIRILD_ZIG", &zig.path);
     }
     command.env("CARGO_ZIRILD_ZIG_TARGET", &options.zig_target);
     command.env("CARGO_ZIRILD_OPTIMIZE", &options.optimize);
@@ -2066,7 +2119,7 @@ mod tests {
             prepare_linux_arguments_in_directory(arguments, &directory, false, true).unwrap();
         assert_eq!(stripped, 2);
         assert_eq!(prepared.len(), 2);
-        assert!(prepared[1] == OsString::from("-lc"));
+        assert_eq!(prepared[1], OsString::from("-lc"));
         let rewritten = fs::read_to_string(PathBuf::from(
             prepared[0].to_string_lossy().strip_prefix('@').unwrap(),
         ))
@@ -2210,15 +2263,51 @@ mod tests {
                 OsString::from("run")
             ]
         );
-        assert!(!requests_driver_help(&[
-            OsString::from("-target=x86_64-pc-windows-msvc"),
-            OsString::from("run"),
-            OsString::from("--help")
-        ]));
-        assert!(requests_driver_help(&[
-            OsString::from("-target=x86_64-pc-windows-msvc"),
-            OsString::from("--help")
-        ]));
+        assert_eq!(
+            driver_request(&[
+                OsString::from("-target=x86_64-pc-windows-msvc"),
+                OsString::from("run"),
+                OsString::from("--help")
+            ]),
+            None
+        );
+        assert_eq!(
+            driver_request(&[
+                OsString::from("-target=x86_64-pc-windows-msvc"),
+                OsString::from("--help")
+            ]),
+            Some(DriverRequest::Help)
+        );
+    }
+
+    #[test]
+    fn recognizes_driver_version_requests_ahead_of_the_cargo_command() {
+        assert_eq!(
+            driver_request(&[OsString::from("-V")]),
+            Some(DriverRequest::Version)
+        );
+        assert_eq!(
+            driver_request(&[OsString::from("zirild"), OsString::from("--version")]),
+            Some(DriverRequest::Version)
+        );
+        assert_eq!(
+            driver_request(&[
+                OsString::from("-target=x86_64-linux-musl"),
+                OsString::from("--version")
+            ]),
+            Some(DriverRequest::Version)
+        );
+        assert_eq!(
+            driver_request(&[
+                OsString::from("run"),
+                OsString::from("--"),
+                OsString::from("--version")
+            ]),
+            None
+        );
+        let version = VERSION.split('.').collect::<Vec<_>>();
+        assert!(version.len() >= 3, "unexpected VERSION: {VERSION}");
+        assert!(version.iter().all(|piece| !piece.is_empty()));
     }
 
     #[test]

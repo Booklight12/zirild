@@ -1,0 +1,11 @@
+[package]
+name = "zirild-mixed-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Standalone Rust + C + C++17 fixture used to validate cargo-zirild wrapper modes. Not part of the published cargo-zirild package."
+
+[build-dependencies]
+cc = "1"
+
+[workspace]

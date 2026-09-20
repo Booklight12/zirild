@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+- Add `-V`/`--version`, which reports the cargo-zirild version without requiring
+  `-target`. A Cargo subcommand is expected to answer a version query; the
+  previous behavior fell through to Cargo's argument phase and failed with
+  `missing required -target=<zig-target>`.
+- Print the resolved Zig version in the build-start log. Zirild already ran
+  `zig version` to validate the selected executable but discarded the output,
+  which left a build unable to be matched against the Zig release it was proven
+  on.
+- List `asm` in the built-in help. The command has been supported since 0.1.9,
+  but the usage text still ended at `doc`.
+- Add a command-line contract suite in `tests/cli.rs`, covering the help and
+  version surface plus the argument rejections that must never reach Cargo.
+- Complete `examples/mixed` into a runnable Rust, C, and C++17 fixture. It now
+  ships a manifest, `build.rs`, and a Rust caller, and the C++ unit exports a
+  C-linkage entry point instead of owning `main`. The example stays out of the
+  published package.
+- Exclude `.workbuddy` from the published package: `cargo package` was collecting
+  workspace-local notes into the `.crate` archive.
+- Add a CI workflow that runs formatting, `clippy -D warnings`, the test suite,
+  and the fixture on Windows and Linux, plus a Windows job that builds the
+  fixture through Zig for the Windows GNU and Linux musl targets.
+- Normalize tracked text files to LF through `.gitattributes`, and ignore nested
+  `target` directories.
+
 ## 0.1.9 - 2026-09-07
 
 - Support the `asm` Cargo command: dispatch the installed cargo-show-asm plugin

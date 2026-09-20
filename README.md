@@ -26,6 +26,25 @@ archiver, and linker selected around Cargo.
 Zirild never switches an Android build to NDK Clang/LLD silently. The fallback
 requires `-ndkfallback` and emits a prominent build warning.
 
+## Requirements
+
+- A Rust toolchain with the target installed: `rustup target add <triple>` for
+  every target you build.
+- A Zig installation that provides `zig cc`, `zig c++`, and `zig ar`, and that
+  can cross-compile to the selected target.
+
+Zig versions differ in the C/C++ driver and LLD arguments Zirild has to work
+around, so the version in use matters. The support matrix above was proven
+against Zig 0.16.0, the newest tagged release at that time, and Zirild does not
+impose a minimum-version check. Every build log therefore starts with the
+toolchain it resolved:
+
+```text
++ cargo build --target x86_64-unknown-linux-musl (Zig 0.16.0 / x86_64-linux-musl / ReleaseSafe)
+```
+
+If a build fails on a different Zig release, report it with that banner.
+
 ## Install
 
 ```powershell
@@ -172,6 +191,7 @@ through unchanged; Zirild does not reserve `-Z`.
 | `--preserve-linker-args` | alias for `--windows-runtime=preserve` |
 | `--trace` | print native wrapper invocation details |
 | `-h`, `--help` | show command help |
+| `-V`, `--version` | print the cargo-zirild version |
 
 The legacy `-zigpatch=<path>` and `-ZigOptimize=<mode>` spellings remain
 accepted for compatibility.
@@ -315,14 +335,31 @@ goal.
 
 ## Validation
 
-The current source was validated on 2026-07-14 with a temporary standalone
-fixture outside the published package. The exact targets and results are listed
-under [Target triple support](#target-triple-support).
+The fixture used for validation is [examples/mixed](examples/mixed): a standalone
+crate with `cc-rs`, one C translation unit, one C++17 translation unit, and Rust
+`extern "C"` calls into both. It is excluded from the published package and is
+built directly:
 
-The native fixture used `cc-rs`, one C translation unit, one C++17 translation
-unit, and Rust `extern "C"` calls. Build traces confirmed the expected C, C++,
-archive, and final-link wrapper modes. All three runnable binaries completed
-with exit code 0 and produced the expected interop results.
+```text
+cd examples/mixed
+cargo zirild -target=x86_64-pc-windows-gnu run
+cargo zirild -target=x86_64-unknown-linux-gnu build
+cargo zirild -target=x86_64-unknown-linux-musl build
+```
+
+Build traces confirmed the expected C, C++, archive, and final-link wrapper
+modes. The runnable binaries exit with code 0 and report the expected interop
+result: C returns 42 and C++ returns 43.
+
+The current source was validated on 2026-07-14 against the temporary standalone
+fixture that this repository example replaces. The exact targets and results are
+listed under [Target triple support](#target-triple-support).
+
+On 2026-09-20 the repository fixture was rebuilt with Zig 0.16.0 on Windows for
+`x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`, and
+`x86_64-unknown-linux-musl`. The MSVC binary ran and reported the expected
+interop result; the GNU target produced a PIE ELF and the musl target produced a
+statically linked ELF with no `PT_INTERP`.
 
 Android artifacts were inspected with the selected NDK's `llvm-readelf`.
 Android device execution has not yet been validated.
